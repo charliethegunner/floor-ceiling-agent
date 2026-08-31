@@ -157,12 +157,13 @@ export function runFuzzGate(numRuns = 1000): GateResult {
 // ---------------------------------------------------------------------------
 // Gate 3 (Symbolic): Z3 proves register-file equivalence between an x86
 // instruction and the REAL emitted ARM64 output for MOV/ADD/CMP over
-// register-register operands. This proves the translation rules for these
-// opcodes are correct for every possible 64-bit register value (not just
-// example inputs) — it does not model memory/SIB addressing, PUSH/POP/CALL
-// stack effects, or flags, which is out of scope (see SPEC-012's scoping
-// precedent: this is translation validation of value-transfer semantics,
-// not a full formal model of either ISA).
+// register-register operands, and (Phase 1, below) PUSH/POP with explicit
+// RSP/SP tracking over the SMT theory of arrays. This proves the translation
+// rules for these opcodes are correct for every possible 64-bit value (not
+// just example inputs) — it does not model SIB addressing, CALL's stack
+// effect, or flags, which remain out of scope (see SPEC-012's scoping
+// precedent: this is translation validation of value-transfer and
+// stack-transition semantics, not a full formal model of either ISA).
 // ---------------------------------------------------------------------------
 
 const SYMBOLIC_REGISTERS: X86Register[] = ['RAX', 'RBX', 'RCX', 'RDX']
@@ -189,6 +190,185 @@ function parseArm64Line(line: string): { opcode: string; operands: string[] } {
           .map((operand) => operand.trim())
   return { opcode, operands }
 }
+
+// ---------------------------------------------------------------------------
+// Gate 3, Phase 1: PUSH/POP and RSP tracking.
+//
+// Memory is modeled as a Z3 Array from BitVec(64) to BitVec(64) - one 64-bit
+// word per stack slot, matching the 8-byte increments PUSH/POP already use
+// throughout this codebase. Ground truth is x86's fixed, ISA-defined
+// behavior (PUSH always moves RSP by exactly 8; the read/write addresses are
+// dictated by PUSH/POP's own semantics, not the candidate's). The
+// candidate's own claimed offset is extracted from its ARM64 text via regex
+// and compared against that ground truth, so a wrong constant (e.g. #-4
+// instead of #-8) is a genuine Z3 disagreement, not a string-shape mismatch.
+//
+// Each check takes an optional `candidateOverride` so it can be exercised
+// directly - with both a correct and a deliberately-wrong candidate - by
+// unit tests, without needing to mock the real translation pipeline.
+// ---------------------------------------------------------------------------
+
+const PUSH_ARM64_PATTERN = /^STR\s+(\S+),\s*\[SP,\s*#(-?\d+)\]!$/
+const POP_ARM64_PATTERN = /^LDR\s+(\S+),\s*\[SP\],\s*#(-?\d+)$/
+
+type CandidateResolution = { ok: true; text: string } | { ok: false; details: string }
+
+function resolveCandidate(x86Line: string, candidateOverride: string | undefined): CandidateResolution {
+  if (candidateOverride !== undefined) return { ok: true, text: candidateOverride }
+  const translated = translateX86ToArm64(x86Line)
+  if (!translated.ok) return { ok: false, details: `pipeline failed to translate "${x86Line}": ${translated.error}` }
+  return { ok: true, text: translated.instruction }
+}
+
+export async function checkPushEquivalence(x86Line: string, candidateOverride?: string): Promise<GateResult> {
+  const parsedX86 = parseInstruction(x86Line)
+  if (!parsedX86 || parsedX86.opcode !== 'PUSH' || parsedX86.operands.length !== 1) {
+    return { gate: 'symbolic', ok: false, details: `expected a single-operand PUSH instruction, got "${x86Line}"` }
+  }
+  const [regTok] = parsedX86.operands as [X86Register]
+  const armReg = registerMap[regTok]
+
+  const resolved = resolveCandidate(x86Line, candidateOverride)
+  if (!resolved.ok) return { gate: 'symbolic', ok: false, details: resolved.details }
+
+  const match = PUSH_ARM64_PATTERN.exec(resolved.text.trim())
+  if (!match) {
+    return { gate: 'symbolic', ok: false, details: `expected "STR ${armReg}, [SP, #-8]!" shape, got "${resolved.text}"` }
+  }
+  const [, candReg, offsetText] = match
+  if (candReg !== armReg) {
+    return { gate: 'symbolic', ok: false, details: `expected destination register ${armReg}, got ${candReg}` }
+  }
+
+  const { Context } = await init()
+  const { Solver, BitVec, Array: Z3Array, Or } = Context('floor-engine-stack')
+  const rsp = BitVec.const('rsp', 64)
+  const regVal = BitVec.const('regVal', 64)
+  const mem = Z3Array.const('mem', BitVec.sort(64), BitVec.sort(64))
+
+  const x86RspPost = rsp.sub(8)
+  const x86MemPost = mem.store(x86RspPost, regVal)
+
+  const candRspPost = rsp.add(Number(offsetText))
+  const candMemPost = mem.store(candRspPost, regVal)
+
+  const solver = new Solver()
+  solver.add(Or(x86RspPost.neq(candRspPost), x86MemPost.neq(candMemPost)))
+  const result = await solver.check()
+
+  if (result !== 'unsat') {
+    return { gate: 'symbolic', ok: false, details: `Z3 disproved PUSH equivalence for "${x86Line}" -> "${resolved.text}" (${result})` }
+  }
+  return {
+    gate: 'symbolic',
+    ok: true,
+    details: `Z3 proved "${x86Line}" -> "${resolved.text}" correctly decrements RSP by 8 and stores at the new top of stack`,
+  }
+}
+
+export async function checkPopEquivalence(x86Line: string, candidateOverride?: string): Promise<GateResult> {
+  const parsedX86 = parseInstruction(x86Line)
+  if (!parsedX86 || parsedX86.opcode !== 'POP' || parsedX86.operands.length !== 1) {
+    return { gate: 'symbolic', ok: false, details: `expected a single-operand POP instruction, got "${x86Line}"` }
+  }
+  const [regTok] = parsedX86.operands as [X86Register]
+  const armReg = registerMap[regTok]
+
+  const resolved = resolveCandidate(x86Line, candidateOverride)
+  if (!resolved.ok) return { gate: 'symbolic', ok: false, details: resolved.details }
+
+  const match = POP_ARM64_PATTERN.exec(resolved.text.trim())
+  if (!match) {
+    return { gate: 'symbolic', ok: false, details: `expected "LDR ${armReg}, [SP], #8" shape, got "${resolved.text}"` }
+  }
+  const [, candReg, offsetText] = match
+  if (candReg !== armReg) {
+    return { gate: 'symbolic', ok: false, details: `expected destination register ${armReg}, got ${candReg}` }
+  }
+
+  const { Context } = await init()
+  const { Solver, BitVec, Array: Z3Array, Or } = Context('floor-engine-stack')
+  const rsp = BitVec.const('rsp', 64)
+  const mem = Z3Array.const('mem', BitVec.sort(64), BitVec.sort(64))
+
+  // Post-indexed LDR always reads at the pre-update address, regardless of
+  // the offset - only the resulting RSP can disagree with a wrong offset.
+  const x86DstPost = mem.select(rsp)
+  const x86RspPost = rsp.add(8)
+  const candDstPost = mem.select(rsp)
+  const candRspPost = rsp.add(Number(offsetText))
+
+  const solver = new Solver()
+  solver.add(Or(x86DstPost.neq(candDstPost), x86RspPost.neq(candRspPost)))
+  const result = await solver.check()
+
+  if (result !== 'unsat') {
+    return { gate: 'symbolic', ok: false, details: `Z3 disproved POP equivalence for "${x86Line}" -> "${resolved.text}" (${result})` }
+  }
+  return {
+    gate: 'symbolic',
+    ok: true,
+    details: `Z3 proved "${x86Line}" -> "${resolved.text}" correctly loads from the top of stack and increments RSP by 8`,
+  }
+}
+
+export async function checkPushPopRoundTrip(register: X86Register, candidateOverride?: string): Promise<GateResult> {
+  const armReg = registerMap[register]
+  const resolved = resolveCandidate(`PUSH ${register}\nPOP ${register}`, candidateOverride)
+  if (!resolved.ok) return { gate: 'symbolic', ok: false, details: resolved.details }
+
+  const lines = resolved.text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+  if (lines.length !== 2) {
+    return { gate: 'symbolic', ok: false, details: `expected a 2-line PUSH+POP program, got: "${resolved.text}"` }
+  }
+
+  const pushMatch = PUSH_ARM64_PATTERN.exec(lines[0])
+  const popMatch = POP_ARM64_PATTERN.exec(lines[1])
+  if (!pushMatch || !popMatch) {
+    return {
+      gate: 'symbolic',
+      ok: false,
+      details: `expected "STR ${armReg}, [SP, #-8]!" then "LDR ${armReg}, [SP], #8", got: "${resolved.text}"`,
+    }
+  }
+  const [, pushReg, pushOffsetText] = pushMatch
+  const [, popReg, popOffsetText] = popMatch
+  if (pushReg !== armReg || popReg !== armReg) {
+    return { gate: 'symbolic', ok: false, details: `expected both lines to reference ${armReg}, got push=${pushReg} pop=${popReg}` }
+  }
+
+  const { Context } = await init()
+  const { Solver, BitVec, Array: Z3Array, Or } = Context('floor-engine-stack')
+  const rsp = BitVec.const('rsp', 64)
+  const regVal = BitVec.const('regVal', 64)
+  const mem = Z3Array.const('mem', BitVec.sort(64), BitVec.sort(64))
+
+  const rspAfterPush = rsp.add(Number(pushOffsetText))
+  const memAfterPush = mem.store(rspAfterPush, regVal)
+  const dstAfterPop = memAfterPush.select(rspAfterPush)
+  const rspAfterPop = rspAfterPush.add(Number(popOffsetText))
+
+  const solver = new Solver()
+  // Valid stack discipline: popping what you just pushed returns the
+  // original value and restores RSP to exactly where it started.
+  solver.add(Or(dstAfterPop.neq(regVal), rspAfterPop.neq(rsp)))
+  const result = await solver.check()
+
+  if (result !== 'unsat') {
+    return { gate: 'symbolic', ok: false, details: `Z3 disproved the PUSH/POP round trip for ${register} -> "${resolved.text}" (${result})` }
+  }
+  return {
+    gate: 'symbolic',
+    ok: true,
+    details: `Z3 proved PUSH ${register} then POP ${register} restores both ${armReg} and RSP for all possible values`,
+  }
+}
+
+const STACK_CASES = ['PUSH RAX', 'PUSH RDI', 'POP RBX', 'POP RCX']
+const ROUND_TRIP_REGISTERS: X86Register[] = ['RAX', 'RDI']
 
 export async function runSymbolicGate(): Promise<GateResult> {
   const { Context } = await init()
@@ -244,10 +424,22 @@ export async function runSymbolicGate(): Promise<GateResult> {
     }
   }
 
+  for (const x86Line of STACK_CASES) {
+    const result = x86Line.startsWith('PUSH') ? await checkPushEquivalence(x86Line) : await checkPopEquivalence(x86Line)
+    if (!result.ok) return result
+  }
+  for (const register of ROUND_TRIP_REGISTERS) {
+    const result = await checkPushPopRoundTrip(register)
+    if (!result.ok) return result
+  }
+
   return {
     gate: 'symbolic',
     ok: true,
-    details: `Z3 proved register-file equivalence for ${EQUIVALENCE_CASES.length} MOV/ADD/CMP cases across all possible 64-bit values`,
+    details:
+      `Z3 proved register-file equivalence for ${EQUIVALENCE_CASES.length} MOV/ADD/CMP cases, ` +
+      `${STACK_CASES.length} PUSH/POP stack transitions, and ${ROUND_TRIP_REGISTERS.length} PUSH/POP round trips, ` +
+      'all across every possible 64-bit value',
   }
 }
 
