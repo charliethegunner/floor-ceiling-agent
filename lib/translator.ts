@@ -1,4 +1,4 @@
-export type X86Register = 'RAX' | 'RBX' | 'RCX' | 'RDX' | 'RSP' | 'RBP'
+export type X86Register = 'RAX' | 'RBX' | 'RCX' | 'RDX' | 'RSP' | 'RBP' | 'RDI'
 export type Arm64Register = 'X0' | 'X1' | 'X2' | 'X3' | 'SP' | 'FP'
 
 export const registerMap: Record<X86Register, Arm64Register> = {
@@ -8,6 +8,7 @@ export const registerMap: Record<X86Register, Arm64Register> = {
   RDX: 'X3',
   RSP: 'SP',
   RBP: 'FP',
+  RDI: 'X0',
 }
 
 export interface TranslationSuccess {
@@ -59,7 +60,7 @@ function resolveOperand(operand: string): OperandResolution {
   return { ok: false, error: `invalid operand: ${operand}` }
 }
 
-const SUPPORTED_OPCODES = ['MOV', 'ADD', 'PUSH', 'POP'] as const
+const SUPPORTED_OPCODES = ['MOV', 'ADD', 'PUSH', 'POP', 'CALL'] as const
 type SupportedOpcode = (typeof SUPPORTED_OPCODES)[number]
 
 function isSupportedOpcode(opcode: string): opcode is SupportedOpcode {
@@ -111,6 +112,21 @@ export function translateInstruction(input: string): TranslationResult {
     return opcode === 'PUSH'
       ? { ok: true, instruction: `STR ${operand.value}, [SP, #-8]!` }
       : { ok: true, instruction: `LDR ${operand.value}, [SP], #8` }
+  }
+
+  if (opcode === 'CALL') {
+    if (operands.length !== 1) {
+      return { ok: false, error: `invalid instruction format: "${input}"` }
+    }
+    const target = operands[0]
+    if (target.startsWith('[')) {
+      return { ok: false, error: `memory operand not supported for opcode: ${opcode}` }
+    }
+    const upperTarget = target.toUpperCase()
+    if (isX86Register(upperTarget)) {
+      return { ok: true, instruction: `BLR ${registerMap[upperTarget]}` }
+    }
+    return { ok: true, instruction: `BL ${target}` }
   }
 
   if (operands.length !== 2) {

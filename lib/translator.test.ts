@@ -10,6 +10,7 @@ describe('registerMap', () => {
       RDX: 'X3',
       RSP: 'SP',
       RBP: 'FP',
+      RDI: 'X0',
     })
   })
 })
@@ -292,6 +293,44 @@ describe('translateInstruction with stack push/pop operations', () => {
     expect(result).toEqual({
       ok: false,
       error: 'invalid instruction format: "POP RAX, RBX"',
+    })
+  })
+})
+
+describe('translateInstruction with CALL', () => {
+  test('translates a direct call to a label into BL', () => {
+    const result = translateInstruction('CALL _my_function')
+
+    expect(result).toEqual({ ok: true, instruction: 'BL _my_function' })
+  })
+
+  test('translates an indirect call through RAX into BLR', () => {
+    const result = translateInstruction('CALL RAX')
+
+    expect(result).toEqual({ ok: true, instruction: 'BLR X0' })
+  })
+
+  test('translates an indirect call through RDI into BLR', () => {
+    const result = translateInstruction('CALL RDI')
+
+    expect(result).toEqual({ ok: true, instruction: 'BLR X0' })
+  })
+
+  test('returns an error for a memory-indirect call', () => {
+    const result = translateInstruction('CALL [RAX]')
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'memory operand not supported for opcode: CALL',
+    })
+  })
+
+  test('returns an error for a call with multiple operands', () => {
+    const result = translateInstruction('CALL RAX, RBX')
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'invalid instruction format: "CALL RAX, RBX"',
     })
   })
 })
