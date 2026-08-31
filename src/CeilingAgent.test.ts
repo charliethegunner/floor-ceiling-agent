@@ -1,5 +1,14 @@
 import { describe, expect, test } from 'vitest'
-import { runCeilingAgent, CeilingAgentExhaustedError, OpenAiCompatibleLlmClient, verifyInstructionCandidate, type LlmClient } from './CeilingAgent'
+import {
+  runCeilingAgent,
+  CeilingAgentExhaustedError,
+  OpenAiCompatibleLlmClient,
+  verifyInstructionCandidate,
+  buildPrompt,
+  type LlmClient,
+  type CeilingRequest,
+  type CeilingAttempt,
+} from './CeilingAgent'
 
 class ScriptedLlmClient implements LlmClient {
   private index = 0
@@ -255,5 +264,77 @@ describe('OpenAiCompatibleLlmClient', () => {
     } finally {
       globalThis.fetch = originalFetch
     }
+  })
+})
+
+describe('buildPrompt: deterministic correction prompts (Phase 4)', () => {
+  test('is deterministic: identical request and history produce byte-identical prompts', () => {
+    const request: CeilingRequest = { kind: 'instruction', description: 'SUB RCX, RAX' }
+    const history: CeilingAttempt[] = [
+      {
+        attempt: 1,
+        candidate: 'SUB X0, X2',
+        failedGate: {
+          gate: 'symbolic',
+          ok: false,
+          details: 'Z3 found a disagreeing case (SAT model): dst=#x0000000000000001, src=#x0000000000000000',
+        },
+      },
+    ]
+
+    expect(buildPrompt(request, history)).toBe(buildPrompt(request, history))
+  })
+
+  test('a Z3 counterexample surfaces verbatim in the correction prompt, clearly labeled', () => {
+    const request: CeilingRequest = { kind: 'instruction', description: 'SUB RCX, RAX' }
+    const counterexample = 'Z3 found a disagreeing case (SAT model): dst=#x0000000000000001, src=#x0000000000000000'
+    const history: CeilingAttempt[] = [{ attempt: 1, candidate: 'SUB X0, X2', failedGate: { gate: 'symbolic', ok: false, details: counterexample } }]
+
+    const prompt = buildPrompt(request, history)
+
+    expect(prompt).toContain('Attempt 1 was rejected - gate "symbolic"')
+    expect(prompt).toContain(`Counterexample/details: ${counterexample}`)
+    expect(prompt).toContain('Rejected candidate:\nSUB X0, X2')
+  })
+
+  test('a fast-check-style counterexample surfaces verbatim too - buildPrompt does not care which gate produced it', () => {
+    const request: CeilingRequest = { kind: 'instruction', description: 'MOV RAX, [RBX]' }
+    const counterexample = 'unexpected ARM64 register token "X9" in output for: "MOV RAX, [RBX]"'
+    const history: CeilingAttempt[] = [{ attempt: 1, candidate: 'LDR X9, [X1]', failedGate: { gate: 'fuzz', ok: false, details: counterexample } }]
+
+    const prompt = buildPrompt(request, history)
+
+    expect(prompt).toContain(`Counterexample/details: ${counterexample}`)
+  })
+
+  test('multiple rejected attempts accumulate in order', () => {
+    const request: CeilingRequest = { kind: 'instruction', description: 'ADD RAX, RBX' }
+    const history: CeilingAttempt[] = [
+      { attempt: 1, candidate: 'ADD X1, X0', failedGate: { gate: 'symbolic', ok: false, details: 'first failure' } },
+      { attempt: 2, candidate: 'ADD X0, X1', failedGate: { gate: 'symbolic', ok: false, details: 'second failure' } },
+    ]
+
+    const prompt = buildPrompt(request, history)
+    const firstIndex = prompt.indexOf('Attempt 1')
+    const secondIndex = prompt.indexOf('Attempt 2')
+
+    expect(firstIndex).toBeGreaterThan(-1)
+    expect(secondIndex).toBeGreaterThan(firstIndex)
+  })
+
+  test('a first attempt (no history) omits the feedback section entirely', () => {
+    const request: CeilingRequest = { kind: 'instruction', description: 'MOV RAX, RBX' }
+
+    const prompt = buildPrompt(request, [])
+
+    expect(prompt).not.toContain('Previous attempts were rejected')
+    expect(prompt).toContain('x86 instruction: MOV RAX, RBX')
+  })
+})
+
+describe('verifyInstructionCandidate: expressed via the generic VerificationFloor contract (Phase 4)', () => {
+  test('still returns exactly the static/fuzz/symbolic gates, in order, after the floor-based refactor', async () => {
+    const gates = await verifyInstructionCandidate('MOV RAX, RBX', 'MOV X0, X1')
+    expect(gates.map((g) => g.gate)).toEqual(['static', 'fuzz', 'symbolic'])
   })
 })

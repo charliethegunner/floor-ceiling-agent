@@ -1,6 +1,7 @@
 import { Project, SyntaxKind } from 'ts-morph'
 import { X86Register, registerMap, parseInstruction, JCC_CONDITIONS } from '../lib/translator'
 import { getZ3, checkPushEquivalence, checkPopEquivalence, checkMemoryEquivalence } from './FloorEngine'
+import { type VerificationFloor, runVerificationFloor } from './verification-floor'
 
 // ---------------------------------------------------------------------------
 // LLM client. A local Ollama or vLLM server both expose an OpenAI-compatible
@@ -354,10 +355,33 @@ function checkStaticShape(candidate: string): GateCheckResult {
   return { gate: 'static', ok: true, details: `${lines.length} non-blank line(s), no malformed branch mnemonics` }
 }
 
-export async function verifyInstructionCandidate(x86Instruction: string, candidate: string): Promise<GateCheckResult[]> {
-  const normalized = candidate.toUpperCase()
+// Expressing the three existing checks as a concrete VerificationFloor
+// proves the generic plugin contract (src/verification-floor.ts) actually
+// fits a real domain, not just a paper interface - this is the ARM64
+// instruction-translation floor, alongside the not-yet-implemented
+// TopologyEngineFloor/ClaimVerificationFloor placeholders it defines.
+interface Arm64InstructionCandidate {
+  x86Instruction: string
+  candidate: string
+}
 
-  return [checkStaticShape(normalized), checkRegisterTokenValidity(normalized), await checkSymbolicEquivalence(x86Instruction, normalized)]
+type Arm64GateName = 'static' | 'fuzz' | 'symbolic'
+
+const ARM64_INSTRUCTION_FLOOR: VerificationFloor<Arm64InstructionCandidate, Arm64GateName> = {
+  domain: 'arm64-instruction-translation',
+  gates: [
+    { name: 'static', check: ({ candidate }) => checkStaticShape(candidate) },
+    { name: 'fuzz', check: ({ candidate }) => checkRegisterTokenValidity(candidate) },
+    { name: 'symbolic', check: ({ x86Instruction, candidate }) => checkSymbolicEquivalence(x86Instruction, candidate) },
+  ],
+}
+
+export async function verifyInstructionCandidate(x86Instruction: string, candidate: string): Promise<GateCheckResult[]> {
+  // Register names and opcodes are case-insensitive in real ARM64 assembly;
+  // normalized once here (see Phase 3.1) so every gate in the floor sees
+  // consistent-case text, without mutating what's returned to the caller.
+  const report = await runVerificationFloor(ARM64_INSTRUCTION_FLOOR, { x86Instruction, candidate: candidate.toUpperCase() })
+  return report.gates
 }
 
 // ---------------------------------------------------------------------------
@@ -407,9 +431,23 @@ function verifyPatchCandidate(candidate: string): GateCheckResult[] {
 // Retry loop
 // ---------------------------------------------------------------------------
 
-function buildPrompt(request: CeilingRequest, history: CeilingAttempt[]): string {
+// The self-healing correction loop's whole value depends on this being
+// deterministic (same request + same rejection history -> byte-identical
+// prompt, always - no Date.now()/Math.random() anywhere near it) and on
+// each rejected attempt's counterexample surfacing verbatim, not summarized
+// or dropped: a Z3 gate's `details` already contains its SAT model (see
+// checkSymbolicEquivalence's "Z3 found a disagreeing case (SAT model): ...")
+// and a fast-check-driven gate's `details` would carry its own shrunk
+// counterexample the same way - buildPrompt doesn't need to know which kind
+// of gate produced the failure, only to pass its details through exactly.
+export function buildPrompt(request: CeilingRequest, history: CeilingAttempt[]): string {
   const feedback = history
-    .map((a) => `Attempt ${a.attempt} was rejected (gate "${a.failedGate.gate}"): ${a.failedGate.details}\nRejected candidate:\n${a.candidate}`)
+    .map(
+      (a) =>
+        `Attempt ${a.attempt} was rejected - gate "${a.failedGate.gate}".\n` +
+        `Counterexample/details: ${a.failedGate.details}\n` +
+        `Rejected candidate:\n${a.candidate}`
+    )
     .join('\n\n')
 
   const header =
