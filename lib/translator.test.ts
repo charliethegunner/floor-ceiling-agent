@@ -10,7 +10,7 @@ describe('registerMap', () => {
       RDX: 'X3',
       RSP: 'SP',
       RBP: 'FP',
-      RDI: 'X0',
+      RDI: 'X4',
     })
   })
 })
@@ -313,7 +313,13 @@ describe('translateInstruction with CALL', () => {
   test('translates an indirect call through RDI into BLR', () => {
     const result = translateInstruction('CALL RDI')
 
-    expect(result).toEqual({ ok: true, instruction: 'BLR X0' })
+    expect(result).toEqual({ ok: true, instruction: 'BLR X4' })
+  })
+
+  test('does not alias RAX and RDI to the same ARM64 register', () => {
+    const result = translateInstruction('MOV RAX, RDI')
+
+    expect(result).toEqual({ ok: true, instruction: 'MOV X0, X4' })
   })
 
   test('returns an error for a memory-indirect call', () => {

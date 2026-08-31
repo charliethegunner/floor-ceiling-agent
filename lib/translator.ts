@@ -1,5 +1,5 @@
 export type X86Register = 'RAX' | 'RBX' | 'RCX' | 'RDX' | 'RSP' | 'RBP' | 'RDI'
-export type Arm64Register = 'X0' | 'X1' | 'X2' | 'X3' | 'SP' | 'FP'
+export type Arm64Register = 'X0' | 'X1' | 'X2' | 'X3' | 'X4' | 'SP' | 'FP'
 
 export const registerMap: Record<X86Register, Arm64Register> = {
   RAX: 'X0',
@@ -8,7 +8,7 @@ export const registerMap: Record<X86Register, Arm64Register> = {
   RDX: 'X3',
   RSP: 'SP',
   RBP: 'FP',
-  RDI: 'X0',
+  RDI: 'X4',
 }
 
 export interface TranslationSuccess {
