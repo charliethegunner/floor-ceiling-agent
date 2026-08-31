@@ -45,23 +45,9 @@ export async function runVerificationFloor<Candidate, GateName extends string = 
   return { ok: gates.every((g) => g.ok), domain: floor.domain, gates }
 }
 
-// ---------------------------------------------------------------------------
-// Placeholder interface for a domain not yet implemented. Deliberately just
-// a marker conforming to VerificationFloor<Candidate, GateName> - no domain
-// logic is invented here, since this engine's actual verification semantics
-// (what a "candidate" is, what its gates check) hasn't been specified yet.
-// It becomes a real floor by supplying `gates` once that spec exists;
-// nothing in CeilingAgent's orchestration loop needs to change when it does,
-// since it already knows only the generic contract above.
-//
-// The Topology Engine's placeholder that used to live here is gone: Phase
-// 4.1 (src/topology-floor.ts) implemented it for real, so a vague stub
-// alongside a concrete floor would just be dead weight.
-// ---------------------------------------------------------------------------
-
-export interface ClaimVerificationCandidate {
-  readonly domain: 'claim-verification'
-  readonly data: unknown
-}
-
-export type ClaimVerificationFloor = VerificationFloor<ClaimVerificationCandidate>
+// Both placeholders that used to live here are gone: the Topology Engine's
+// (Phase 4.1, src/topology-floor.ts) and the Claim Verification Engine's
+// (Phase 4.2, src/claim-floor.ts) are both implemented for real now, so a
+// vague stub alongside a concrete floor would just be dead weight. This
+// file stays purely generic - the plugin contract every floor implements,
+// not a registry of the floors themselves.

@@ -359,8 +359,8 @@ function checkStaticShape(candidate: string): GateCheckResult {
 // proves the generic plugin contract (src/verification-floor.ts) actually
 // fits a real domain, not just a paper interface - this is the ARM64
 // instruction-translation floor, alongside the codebase-topology floor
-// (src/topology-floor.ts, Phase 4.1) and the not-yet-implemented
-// ClaimVerificationFloor placeholder verification-floor.ts still defines.
+// (src/topology-floor.ts, Phase 4.1) and the claim-verification floor
+// (src/claim-floor.ts, Phase 4.2).
 interface Arm64InstructionCandidate {
   x86Instruction: string
   candidate: string
