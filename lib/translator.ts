@@ -13,6 +13,7 @@ export const registerMap: Record<X86Register, Arm64Register> = {
 
 export interface TranslationSuccess {
   ok: true
+  // multi-instruction lowerings (e.g. displaced SIB addressing) join lines with '\n'
   instruction: string
 }
 
@@ -23,11 +24,19 @@ export interface TranslationError {
 
 export type TranslationResult = TranslationSuccess | TranslationError
 
+interface SibOperand {
+  base: string
+  index: string
+  shift: number
+  offset?: string
+}
+
 type OperandResolution =
   | { ok: true; kind: 'register'; value: string }
   | { ok: true; kind: 'immediate'; value: string }
   | { ok: true; kind: 'memory'; base: string; offset?: string }
   | { ok: true; kind: 'label'; value: string }
+  | ({ ok: true; kind: 'sib' } & SibOperand)
   | { ok: false; error: string }
 
 function isX86Register(name: string): name is X86Register {
@@ -35,6 +44,9 @@ function isX86Register(name: string): name is X86Register {
 }
 
 const MEMORY_OPERAND_PATTERN = /^\[\s*([A-Za-z0-9]+)\s*(?:([+-])\s*(\d+))?\s*\]$/
+const SIB_OPERAND_PATTERN =
+  /^\[\s*([A-Za-z0-9]+)\s*\+\s*([A-Za-z0-9]+)\s*\*\s*(1|2|4|8)\s*(?:([+-])\s*(0[xX][0-9A-Fa-f]+|\d+))?\s*\]$/
+const SCALE_TO_SHIFT: Record<string, number> = { '1': 0, '2': 1, '4': 2, '8': 3 }
 
 function resolveOperand(operand: string): OperandResolution {
   const upper = operand.toUpperCase()
@@ -45,6 +57,29 @@ function resolveOperand(operand: string): OperandResolution {
     return { ok: true, kind: 'immediate', value: `#${operand}` }
   }
   if (operand.startsWith('[')) {
+    const sibMatch = SIB_OPERAND_PATTERN.exec(operand)
+    if (sibMatch) {
+      const [, baseRaw, indexRaw, scale, sign, dispRaw] = sibMatch
+      const baseName = baseRaw.toUpperCase()
+      const indexName = indexRaw.toUpperCase()
+      if (!isX86Register(baseName) || !isX86Register(indexName)) {
+        return { ok: false, error: `invalid operand: ${operand}` }
+      }
+      if (indexName === 'RSP') {
+        return { ok: false, error: `invalid index register: ${operand}` }
+      }
+      const offset = dispRaw
+        ? `${sign === '-' ? '-' : ''}${/^0x/i.test(dispRaw) ? parseInt(dispRaw, 16) : parseInt(dispRaw, 10)}`
+        : undefined
+      return {
+        ok: true,
+        kind: 'sib',
+        base: registerMap[baseName],
+        index: registerMap[indexName],
+        shift: SCALE_TO_SHIFT[scale],
+        offset,
+      }
+    }
     const match = MEMORY_OPERAND_PATTERN.exec(operand)
     const baseName = match?.[1].toUpperCase()
     if (!match || !baseName || !isX86Register(baseName)) {
@@ -78,6 +113,30 @@ function resolveJumpTarget(operand: string): OperandResolution {
     return { ok: false, error: `invalid jump target: ${operand}` }
   }
   return { ok: true, kind: 'label', value: operand }
+}
+
+const SIB_SCRATCH_REGISTER = 'X9'
+
+function sibAddress(sib: SibOperand): string {
+  return `[${sib.base}, ${sib.index}, LSL #${sib.shift}]`
+}
+
+function buildSibStore(sib: SibOperand, srcValue: string): TranslationSuccess {
+  if (sib.offset === undefined) {
+    return { ok: true, instruction: `STR ${srcValue}, ${sibAddress(sib)}` }
+  }
+  const add = `ADD ${SIB_SCRATCH_REGISTER}, ${sib.base}, #${sib.offset}`
+  const store = `STR ${srcValue}, [${SIB_SCRATCH_REGISTER}, ${sib.index}, LSL #${sib.shift}]`
+  return { ok: true, instruction: `${add}\n${store}` }
+}
+
+function buildSibLoad(dstValue: string, sib: SibOperand): TranslationSuccess {
+  if (sib.offset === undefined) {
+    return { ok: true, instruction: `LDR ${dstValue}, ${sibAddress(sib)}` }
+  }
+  const add = `ADD ${SIB_SCRATCH_REGISTER}, ${sib.base}, #${sib.offset}`
+  const load = `LDR ${dstValue}, [${SIB_SCRATCH_REGISTER}, ${sib.index}, LSL #${sib.shift}]`
+  return { ok: true, instruction: `${add}\n${load}` }
 }
 
 const SUPPORTED_OPCODES = ['MOV', 'ADD', 'CMP', 'PUSH', 'POP', 'CALL', 'JE', 'JNE', 'JG', 'JL', 'JGE', 'JLE'] as const
@@ -177,7 +236,7 @@ export function translateInstruction(input: string): TranslationResult {
   const dst = resolveOperand(operands[0])
   if (!dst.ok) return dst
 
-  if (dst.kind === 'memory') {
+  if (dst.kind === 'memory' || dst.kind === 'sib') {
     if (opcode !== 'MOV') {
       return { ok: false, error: `memory operand not supported for opcode: ${opcode}` }
     }
@@ -185,6 +244,9 @@ export function translateInstruction(input: string): TranslationResult {
     if (!src.ok) return src
     if (src.kind !== 'register') {
       return { ok: false, error: `source must be a register for a memory store: ${operands[1]}` }
+    }
+    if (dst.kind === 'sib') {
+      return buildSibStore(dst, src.value)
     }
     const offset = dst.offset ? `, #${dst.offset}` : ''
     return { ok: true, instruction: `STR ${src.value}, [${dst.base}${offset}]` }
@@ -197,9 +259,12 @@ export function translateInstruction(input: string): TranslationResult {
   const src = resolveOperand(operands[1])
   if (!src.ok) return src
 
-  if (src.kind === 'memory') {
+  if (src.kind === 'memory' || src.kind === 'sib') {
     if (opcode !== 'MOV') {
       return { ok: false, error: `memory operand not supported for opcode: ${opcode}` }
+    }
+    if (src.kind === 'sib') {
+      return buildSibLoad(dst.value, src)
     }
     const offset = src.offset ? `, #${src.offset}` : ''
     return { ok: true, instruction: `LDR ${dst.value}, [${src.base}${offset}]` }

@@ -479,3 +479,113 @@ describe('translateInstruction with signed relational Jcc', () => {
     })
   })
 })
+
+describe('translateInstruction with SIB memory operands', () => {
+  test('decodes a scale-1 SIB load with LSL #0', () => {
+    const result = translateInstruction('MOV RAX, [RBX + RCX*1]')
+
+    expect(result).toEqual({ ok: true, instruction: 'LDR X0, [X1, X2, LSL #0]' })
+  })
+
+  test('decodes a scale-2 SIB load with LSL #1', () => {
+    const result = translateInstruction('MOV RAX, [RBX + RCX*2]')
+
+    expect(result).toEqual({ ok: true, instruction: 'LDR X0, [X1, X2, LSL #1]' })
+  })
+
+  test('decodes a scale-4 SIB load with LSL #2', () => {
+    const result = translateInstruction('MOV RAX, [RBX + RCX*4]')
+
+    expect(result).toEqual({ ok: true, instruction: 'LDR X0, [X1, X2, LSL #2]' })
+  })
+
+  test('decodes a scale-8 SIB load with LSL #3', () => {
+    const result = translateInstruction('MOV RAX, [RBX + RCX*8]')
+
+    expect(result).toEqual({ ok: true, instruction: 'LDR X0, [X1, X2, LSL #3]' })
+  })
+
+  test('decodes a SIB store', () => {
+    const result = translateInstruction('MOV [RBX + RCX*4], RAX')
+
+    expect(result).toEqual({ ok: true, instruction: 'STR X0, [X1, X2, LSL #2]' })
+  })
+
+  test('lowers a SIB load with a decimal displacement to a two-instruction sequence', () => {
+    const result = translateInstruction('MOV RAX, [RBX + RCX*4 + 32]')
+
+    expect(result).toEqual({
+      ok: true,
+      instruction: 'ADD X9, X1, #32\nLDR X0, [X9, X2, LSL #2]',
+    })
+  })
+
+  test('normalizes a hex displacement to decimal', () => {
+    const result = translateInstruction('MOV RAX, [RBX + RCX*4 + 0x20]')
+
+    expect(result).toEqual({
+      ok: true,
+      instruction: 'ADD X9, X1, #32\nLDR X0, [X9, X2, LSL #2]',
+    })
+  })
+
+  test('lowers a negative SIB displacement', () => {
+    const result = translateInstruction('MOV RAX, [RBX + RCX*4 - 8]')
+
+    expect(result).toEqual({
+      ok: true,
+      instruction: 'ADD X9, X1, #-8\nLDR X0, [X9, X2, LSL #2]',
+    })
+  })
+
+  test('lowers a displaced SIB store to a two-instruction sequence', () => {
+    const result = translateInstruction('MOV [RBX + RCX*2 + 16], RAX')
+
+    expect(result).toEqual({
+      ok: true,
+      instruction: 'ADD X9, X1, #16\nSTR X0, [X9, X2, LSL #1]',
+    })
+  })
+
+  test('is case-insensitive for registers inside a SIB operand', () => {
+    const result = translateInstruction('mov rax, [rbx + rcx*4]')
+
+    expect(result).toEqual({ ok: true, instruction: 'LDR X0, [X1, X2, LSL #2]' })
+  })
+
+  test('rejects RSP as the index register', () => {
+    const result = translateInstruction('MOV RAX, [RBX + RSP*2]')
+
+    expect(result).toEqual({ ok: false, error: 'invalid index register: [RBX + RSP*2]' })
+  })
+
+  test('rejects an invalid scale factor', () => {
+    const result = translateInstruction('MOV RAX, [RBX + RCX*3]')
+
+    expect(result).toEqual({ ok: false, error: 'invalid operand: [RBX + RCX*3]' })
+  })
+
+  test('rejects an invalid base register in a SIB operand', () => {
+    const result = translateInstruction('MOV RAX, [RZZ + RCX*4]')
+
+    expect(result).toEqual({ ok: false, error: 'invalid operand: [RZZ + RCX*4]' })
+  })
+
+  test('rejects SIB operands for a non-MOV opcode', () => {
+    const result = translateInstruction('ADD RAX, [RBX + RCX*4]')
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'memory operand not supported for opcode: ADD',
+    })
+  })
+
+  test('rejects a non-register source for a SIB store', () => {
+    const result = translateInstruction('MOV [RBX + RCX*4], 5')
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'source must be a register for a memory store: 5',
+    })
+  })
+})
