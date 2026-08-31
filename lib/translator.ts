@@ -53,7 +53,7 @@ function resolveOperand(operand: string): OperandResolution {
       ok: true,
       kind: 'memory',
       base: registerMap[baseName],
-      offset: magnitude ? `${sign === '-' ? '-' : ''}${magnitude}` : undefined,
+      offset: magnitude && magnitude !== '0' ? `${sign === '-' ? '-' : ''}${magnitude}` : undefined,
     }
   }
   return { ok: false, error: `invalid operand: ${operand}` }
@@ -101,6 +101,20 @@ export function translateInstruction(input: string): TranslationResult {
 
   const dst = resolveOperand(operands[0])
   if (!dst.ok) return dst
+
+  if (dst.kind === 'memory') {
+    if (opcode !== 'MOV') {
+      return { ok: false, error: `memory operand not supported for opcode: ${opcode}` }
+    }
+    const src = resolveOperand(operands[1])
+    if (!src.ok) return src
+    if (src.kind !== 'register') {
+      return { ok: false, error: `source must be a register for a memory store: ${operands[1]}` }
+    }
+    const offset = dst.offset ? `, #${dst.offset}` : ''
+    return { ok: true, instruction: `STR ${src.value}, [${dst.base}${offset}]` }
+  }
+
   if (dst.kind !== 'register') {
     return { ok: false, error: `destination must be a register: ${operands[0]}` }
   }

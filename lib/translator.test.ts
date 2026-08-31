@@ -174,14 +174,67 @@ describe('translateInstruction with indirect memory operands', () => {
     expect(result).toEqual({ ok: false, error: 'invalid operand: [RBX' })
   })
 
-  test('returns an error when the destination is a memory reference', () => {
-    const result = translateInstruction('MOV [RBX], RAX')
+  test('returns an error when the destination is an immediate and the source is memory', () => {
+    const result = translateInstruction('MOV 5, [RAX]')
 
-    expect(result).toEqual({ ok: false, error: 'destination must be a register: [RBX]' })
+    expect(result).toEqual({ ok: false, error: 'destination must be a register: 5' })
   })
 
   test('returns an error when a memory operand is used with an unsupported opcode', () => {
     const result = translateInstruction('ADD RAX, [RBX]')
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'memory operand not supported for opcode: ADD',
+    })
+  })
+})
+
+describe('translateInstruction with indirect memory store operands', () => {
+  test('translates a store with no offset to STR', () => {
+    const result = translateInstruction('MOV [RAX], RBX')
+
+    expect(result).toEqual({ ok: true, instruction: 'STR X1, [X0]' })
+  })
+
+  test('translates a store with a positive offset to STR', () => {
+    const result = translateInstruction('MOV [RBX + 16], RAX')
+
+    expect(result).toEqual({ ok: true, instruction: 'STR X0, [X1, #16]' })
+  })
+
+  test('translates a store with a negative offset to STR', () => {
+    const result = translateInstruction('MOV [RBP - 8], RCX')
+
+    expect(result).toEqual({ ok: true, instruction: 'STR X2, [FP, #-8]' })
+  })
+
+  test('omits a zero offset in the translated STR', () => {
+    const result = translateInstruction('MOV [RAX + 0], RBX')
+
+    expect(result).toEqual({ ok: true, instruction: 'STR X1, [X0]' })
+  })
+
+  test('returns an error for a memory source with a memory destination', () => {
+    const result = translateInstruction('MOV [RAX], [RBX]')
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'source must be a register for a memory store: [RBX]',
+    })
+  })
+
+  test('returns an error for an immediate source with a memory destination', () => {
+    const result = translateInstruction('MOV [RAX], 10')
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'source must be a register for a memory store: 10',
+    })
+  })
+
+  test('returns an error when a memory destination is used with an unsupported opcode', () => {
+    const result = translateInstruction('ADD [RAX], RBX')
 
     expect(result).toEqual({
       ok: false,
