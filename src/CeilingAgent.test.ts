@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { runCeilingAgent, CeilingAgentExhaustedError, OpenAiCompatibleLlmClient, type LlmClient } from './CeilingAgent'
+import { runCeilingAgent, CeilingAgentExhaustedError, OpenAiCompatibleLlmClient, verifyInstructionCandidate, type LlmClient } from './CeilingAgent'
 
 class ScriptedLlmClient implements LlmClient {
   private index = 0
@@ -93,6 +93,67 @@ describe('runCeilingAgent: patch mode', () => {
     await expect(runCeilingAgent({ kind: 'patch', description: 'do nothing useful' }, llm, { maxRetries: 2 })).rejects.toThrow(
       CeilingAgentExhaustedError
     )
+  })
+})
+
+describe('verifyInstructionCandidate: extended ground truth (Phase 3)', () => {
+  test('regression: 0/1-operand opcodes with no ground-truth model report skipped, not an arity failure', async () => {
+    // Found live: the arity check ran before the opcode-lookup, so every
+    // control-flow task failed with "expected a 2-operand instruction"
+    // instead of the intended "no ground-truth model - skipped".
+    for (const [x86, arm64] of [
+      ['JMP done', 'B done'],
+      ['JE done', 'B.EQ done'],
+      ['CALL RCX', 'BLR X2'],
+      ['RET', 'RET'],
+    ] as const) {
+      const gates = await verifyInstructionCandidate(x86, arm64)
+      const symbolic = gates.find((g) => g.gate === 'symbolic')
+      expect(symbolic?.ok, `expected "${x86}" to report skipped, got: ${symbolic?.details}`).toBe(true)
+      expect(symbolic?.details).toContain('no ground-truth semantic model')
+    }
+  })
+
+  test('PUSH is verified via FloorEngine ground truth (reused, not re-derived)', async () => {
+    const gates = await verifyInstructionCandidate('PUSH RAX', 'STR X0, [SP, #-8]!')
+    expect(gates.find((g) => g.gate === 'symbolic')?.ok).toBe(true)
+  })
+
+  test('PUSH with the wrong stack offset is caught', async () => {
+    const gates = await verifyInstructionCandidate('PUSH RAX', 'STR X0, [SP, #-4]!')
+    expect(gates.find((g) => g.gate === 'symbolic')?.ok).toBe(false)
+  })
+
+  test('POP is verified via FloorEngine ground truth', async () => {
+    const gates = await verifyInstructionCandidate('POP RBX', 'LDR X1, [SP], #8')
+    expect(gates.find((g) => g.gate === 'symbolic')?.ok).toBe(true)
+  })
+
+  test('a SIB memory load is verified via FloorEngine ground truth, including the scale-to-shift mapping', async () => {
+    const gates = await verifyInstructionCandidate('MOV RAX, [RBX + RCX*4]', 'LDR X0, [X1, X2, LSL #2]')
+    expect(gates.find((g) => g.gate === 'symbolic')?.ok).toBe(true)
+  })
+
+  test('a SIB memory load with the wrong shift is caught', async () => {
+    const gates = await verifyInstructionCandidate('MOV RAX, [RBX + RCX*4]', 'LDR X0, [X1, X2, LSL #1]')
+    expect(gates.find((g) => g.gate === 'symbolic')?.ok).toBe(false)
+  })
+
+  test('SHL is proven equivalent to ARM64 LSL', async () => {
+    const gates = await verifyInstructionCandidate('SHL RCX, RAX', 'LSL X2, X2, X0')
+    const symbolic = gates.find((g) => g.gate === 'symbolic')
+    expect(symbolic?.ok).toBe(true)
+    expect(symbolic?.details).toContain('Z3 proved')
+  })
+
+  test('SHR is proven equivalent to ARM64 LSR (logical, not arithmetic, shift)', async () => {
+    const gates = await verifyInstructionCandidate('SHR RCX, RAX', 'LSR X2, X2, X0')
+    expect(gates.find((g) => g.gate === 'symbolic')?.ok).toBe(true)
+  })
+
+  test('a candidate using the x86 mnemonic SHR instead of ARM64 LSR is rejected', async () => {
+    const gates = await verifyInstructionCandidate('SHR RCX, RAX', 'SHR X2, X2, X0')
+    expect(gates.find((g) => g.gate === 'symbolic')?.ok).toBe(false)
   })
 })
 

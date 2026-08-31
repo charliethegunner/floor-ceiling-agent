@@ -1,6 +1,6 @@
 import { Project, SyntaxKind } from 'ts-morph'
-import { init } from 'z3-solver'
 import { X86Register, registerMap, parseInstruction } from '../lib/translator'
+import { getZ3, checkPushEquivalence, checkPopEquivalence, checkMemoryEquivalence } from './FloorEngine'
 
 // ---------------------------------------------------------------------------
 // LLM client. A local Ollama or vLLM server both expose an OpenAI-compatible
@@ -121,7 +121,7 @@ const ARM64_REGISTERS = new Set(['X0', 'X1', 'X2', 'X3', 'X4', 'X9', 'SP', 'FP']
 // re-derivation of what translateInstruction already does deterministically.
 // ---------------------------------------------------------------------------
 
-type AluSemantics = 'transfer' | 'add' | 'sub' | 'and' | 'or' | 'xor' | 'compare'
+type AluSemantics = 'transfer' | 'add' | 'sub' | 'and' | 'or' | 'xor' | 'shl' | 'shr' | 'compare'
 
 const X86_SEMANTICS: Partial<Record<string, AluSemantics>> = {
   MOV: 'transfer',
@@ -130,6 +130,8 @@ const X86_SEMANTICS: Partial<Record<string, AluSemantics>> = {
   AND: 'and',
   OR: 'or',
   XOR: 'xor',
+  SHL: 'shl',
+  SHR: 'shr',
   CMP: 'compare',
 }
 
@@ -165,10 +167,31 @@ function checkRegisterTokenValidity(candidate: string): GateCheckResult {
 
 async function checkSymbolicEquivalence(x86Instruction: string, candidate: string): Promise<GateCheckResult> {
   const parsedX86 = parseInstruction(x86Instruction)
-  if (!parsedX86 || parsedX86.operands.length !== 2) {
-    return { gate: 'symbolic', ok: false, details: `cannot verify "${x86Instruction}": expected a 2-operand instruction` }
+  if (!parsedX86) {
+    return { gate: 'symbolic', ok: false, details: `cannot verify "${x86Instruction}": could not parse instruction` }
   }
 
+  // PUSH/POP and memory/SIB MOV have real ground-truth models too, but of a
+  // different shape (stack effects, address computation) than the register-
+  // transfer ALU model below - FloorEngine.ts's Gate 3 already built and
+  // tested exactly these proofs (Phase 1, Phase 1b), so they're reused here
+  // via their candidateOverride parameter rather than re-derived.
+  if (parsedX86.opcode === 'PUSH' && parsedX86.operands.length === 1) {
+    return checkPushEquivalence(x86Instruction, candidate)
+  }
+  if (parsedX86.opcode === 'POP' && parsedX86.operands.length === 1) {
+    return checkPopEquivalence(x86Instruction, candidate)
+  }
+  if (parsedX86.opcode === 'MOV' && parsedX86.operands.length === 2 && parsedX86.operands.some((op) => op.startsWith('['))) {
+    return checkMemoryEquivalence(x86Instruction, candidate)
+  }
+
+  // Opcode-lookup must happen BEFORE the arity check: JMP/Jcc/CALL/RET are
+  // 0- or 1-operand and have no ground-truth model at all, so they must
+  // report "skipped" regardless of operand count - not fail arity first.
+  // (Bug found live: every control-flow task failed with "expected a
+  // 2-operand instruction" until this ordering was fixed - the original
+  // 2-operand-only benchmark tasks never exercised this path.)
   const semantics = X86_SEMANTICS[parsedX86.opcode]
   if (!semantics) {
     return {
@@ -176,6 +199,10 @@ async function checkSymbolicEquivalence(x86Instruction: string, candidate: strin
       ok: true,
       details: `no ground-truth semantic model for opcode "${parsedX86.opcode}" - symbolic check skipped, not a failure`,
     }
+  }
+
+  if (parsedX86.operands.length !== 2) {
+    return { gate: 'symbolic', ok: false, details: `cannot verify "${x86Instruction}": expected a 2-operand instruction` }
   }
 
   const [dstTok, srcTok] = parsedX86.operands.map((operand) => operand.toUpperCase())
@@ -202,24 +229,39 @@ async function checkSymbolicEquivalence(x86Instruction: string, candidate: strin
       : { gate: 'symbolic', ok: false, details: `expected "CMP ${armDst}, ${armSrc}", got "${lines[lines.length - 1] ?? ''}"` }
   }
 
-  const { Context } = await init()
+  const { Context } = await getZ3()
   const { Solver, BitVec } = Context('ceiling-agent')
   const dst = BitVec.const('dst', 64)
   const src = BitVec.const('src', 64)
 
-  const x86Post =
-    semantics === 'transfer'
-      ? src
-      : semantics === 'add'
-        ? dst.add(src)
-        : semantics === 'sub'
-          ? dst.sub(src)
-          : semantics === 'and'
-            ? dst.and(src)
-            : semantics === 'or'
-              ? dst.or(src)
-              : dst.xor(src)
+  // x86 SHR is a logical (zero-filling, unsigned) shift, matching ARM64's
+  // LSR exactly - so this uses .lshr(), not .shr() (which is arithmetic/
+  // sign-extending in z3-solver's API, confirmed empirically: .shr(4) and
+  // .lshr(4) disagree for any value with the high bit set).
+  function applyAlu(op: AluSemantics, a: typeof dst, b: typeof dst): typeof dst {
+    switch (op) {
+      case 'transfer':
+        return b
+      case 'add':
+        return a.add(b)
+      case 'sub':
+        return a.sub(b)
+      case 'and':
+        return a.and(b)
+      case 'or':
+        return a.or(b)
+      case 'xor':
+        return a.xor(b)
+      case 'shl':
+        return a.shl(b)
+      case 'shr':
+        return a.lshr(b)
+      case 'compare':
+        return a
+    }
+  }
 
+  const x86Post = applyAlu(semantics, dst, src)
   const armPre: Record<string, typeof dst> = { [armDst]: dst, [armSrc]: src }
 
   let armPost: typeof dst
@@ -234,9 +276,9 @@ async function checkSymbolicEquivalence(x86Instruction: string, candidate: strin
     armPost = armPre[s]
   } else {
     const armOp = parsedArm.opcode.toUpperCase()
-    // ADD/SUB/AND share their x86 mnemonic on ARM64; bitwise OR/XOR do not -
-    // ARM64 spells them ORR and EOR respectively.
-    const expectedOp = { add: 'ADD', sub: 'SUB', and: 'AND', or: 'ORR', xor: 'EOR' }[semantics]
+    // ADD/SUB/AND share their x86 mnemonic on ARM64; bitwise OR/XOR/shifts do
+    // not - ARM64 spells them ORR, EOR, LSL, LSR respectively.
+    const expectedOp = { add: 'ADD', sub: 'SUB', and: 'AND', or: 'ORR', xor: 'EOR', shl: 'LSL', shr: 'LSR' }[semantics]
     if (armOp !== expectedOp || parsedArm.operands.length !== 3) {
       return {
         gate: 'symbolic',
@@ -252,17 +294,7 @@ async function checkSymbolicEquivalence(x86Instruction: string, candidate: strin
         details: `expected "${expectedOp} ${armDst}, ${armDst}, ${armSrc}", got "${lines[lines.length - 1] ?? ''}"`,
       }
     }
-    const armSrcVal = armPre[s]
-    armPost =
-      semantics === 'add'
-        ? dst.add(armSrcVal)
-        : semantics === 'sub'
-          ? dst.sub(armSrcVal)
-          : semantics === 'and'
-            ? dst.and(armSrcVal)
-            : semantics === 'or'
-              ? dst.or(armSrcVal)
-              : dst.xor(armSrcVal)
+    armPost = applyAlu(semantics, dst, armPre[s])
   }
 
   const solver = new Solver()

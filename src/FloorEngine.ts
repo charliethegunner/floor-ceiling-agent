@@ -12,7 +12,7 @@ import { X86Register, registerMap, parseInstruction, parseX86MemoryOperand } fro
 // same name across many independent checks - stays fresh per check.
 let z3Module: ReturnType<typeof init> | undefined
 
-function getZ3(): ReturnType<typeof init> {
+export function getZ3(): ReturnType<typeof init> {
   if (z3Module === undefined) {
     z3Module = init()
   }
