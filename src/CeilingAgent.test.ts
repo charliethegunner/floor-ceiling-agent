@@ -157,6 +157,69 @@ describe('verifyInstructionCandidate: extended ground truth (Phase 3)', () => {
   })
 })
 
+describe('verifyInstructionCandidate: Gate 1 enforces dot-notation on conditional branches (Phase 3.1)', () => {
+  test('the correctly dotted form is accepted', async () => {
+    const gates = await verifyInstructionCandidate('JE done', 'B.EQ done')
+    expect(gates.find((g) => g.gate === 'static')?.ok).toBe(true)
+  })
+
+  test('a missing dot ("BEQ" instead of "B.EQ") is rejected by the static gate', async () => {
+    const gates = await verifyInstructionCandidate('JE done', 'BEQ done')
+    const staticGate = gates.find((g) => g.gate === 'static')
+    expect(staticGate?.ok).toBe(false)
+    expect(staticGate?.details).toContain('B.EQ')
+  })
+
+  test('a missing dot is rejected for every condition code this translator generates', async () => {
+    const cases: Array<[string, string]> = [
+      ['JNE done', 'BNE done'],
+      ['JG done', 'BGT done'],
+      ['JL done', 'BLT done'],
+      ['JGE done', 'BGE done'],
+      ['JLE done', 'BLE done'],
+    ]
+    for (const [x86, badCandidate] of cases) {
+      const gates = await verifyInstructionCandidate(x86, badCandidate)
+      const staticGate = gates.find((g) => g.gate === 'static')
+      expect(staticGate?.ok, `expected "${badCandidate}" to be rejected`).toBe(false)
+    }
+  })
+
+  test('unconditional B and BL/BLR are never mistaken for a malformed conditional branch', async () => {
+    const jmp = await verifyInstructionCandidate('JMP done', 'B done')
+    expect(jmp.find((g) => g.gate === 'static')?.ok).toBe(true)
+
+    const call = await verifyInstructionCandidate('CALL RCX', 'BL X2')
+    expect(call.find((g) => g.gate === 'static')?.ok).toBe(true)
+
+    const callr = await verifyInstructionCandidate('CALL RAX', 'BLR X0')
+    expect(callr.find((g) => g.gate === 'static')?.ok).toBe(true)
+  })
+})
+
+describe('verifyInstructionCandidate: case-folding normalization (Phase 3.1)', () => {
+  test('a lowercase register-register candidate is still proven symbolically equivalent', async () => {
+    const gates = await verifyInstructionCandidate('MOV RAX, RBX', 'mov x0, x1')
+    expect(gates.find((g) => g.gate === 'symbolic')?.ok).toBe(true)
+  })
+
+  test('a lowercase candidate still passes register-token validity', async () => {
+    const gates = await verifyInstructionCandidate('ADD RCX, RAX', 'add x2, x2, x0')
+    expect(gates.find((g) => g.gate === 'fuzz')?.ok).toBe(true)
+  })
+
+  test('a lowercase conditional branch with the dot present is still accepted (not flagged as malformed)', async () => {
+    const gates = await verifyInstructionCandidate('JE done', 'b.eq done')
+    expect(gates.find((g) => g.gate === 'static')?.ok).toBe(true)
+  })
+
+  test('the returned/history candidate text preserves the model\'s original casing (case-folding is verification-only)', async () => {
+    const llm = new ScriptedLlmClient(['mov x0, x1'])
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm)
+    expect(result.result).toBe('mov x0, x1')
+  })
+})
+
 describe('OpenAiCompatibleLlmClient', () => {
   test('posts an OpenAI-compatible chat-completions request and parses the response', async () => {
     const calls: Array<{ url: string; body: unknown }> = []

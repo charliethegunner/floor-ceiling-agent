@@ -196,6 +196,38 @@ describe('Gate 3 (Symbolic): z3-solver', () => {
       expect(result.details).toContain('expected the scratch register to be X9')
     })
   })
+
+  describe('Phase 3.1: case-folding normalization', () => {
+    test('a lowercase PUSH candidate is still proven equivalent', async () => {
+      const result = await checkPushEquivalence('PUSH RAX', 'str x0, [sp, #-8]!')
+      expect(result.ok).toBe(true)
+    })
+
+    test('a lowercase POP candidate is still proven equivalent', async () => {
+      const result = await checkPopEquivalence('POP RBX', 'ldr x1, [sp], #8')
+      expect(result.ok).toBe(true)
+    })
+
+    test('a lowercase PUSH+POP round trip is still proven equivalent', async () => {
+      const result = await checkPushPopRoundTrip('RAX', 'str x0, [sp, #-8]!\nldr x0, [sp], #8')
+      expect(result.ok).toBe(true)
+    })
+
+    test('a lowercase SIB memory candidate is still proven equivalent', async () => {
+      const result = await checkMemoryEquivalence('MOV RAX, [RBX + RCX*4]', 'ldr x0, [x1, x2, lsl #2]')
+      expect(result.ok).toBe(true)
+    })
+
+    test('a mixed-case memory candidate is still proven equivalent', async () => {
+      const result = await checkMemoryEquivalence('MOV RAX, [RBX + 16]', 'Ldr X0, [x1, #16]')
+      expect(result.ok).toBe(true)
+    })
+
+    test('case-folding does not mask a genuine wrong-offset bug (still lowercase)', async () => {
+      const result = await checkPushEquivalence('PUSH RAX', 'str x0, [sp, #-4]!')
+      expect(result.ok).toBe(false)
+    })
+  })
 })
 
 describe('runFloorEngine', () => {

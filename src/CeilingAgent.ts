@@ -1,5 +1,5 @@
 import { Project, SyntaxKind } from 'ts-morph'
-import { X86Register, registerMap, parseInstruction } from '../lib/translator'
+import { X86Register, registerMap, parseInstruction, JCC_CONDITIONS } from '../lib/translator'
 import { getZ3, checkPushEquivalence, checkPopEquivalence, checkMemoryEquivalence } from './FloorEngine'
 
 // ---------------------------------------------------------------------------
@@ -320,17 +320,44 @@ async function checkSymbolicEquivalence(x86Instruction: string, candidate: strin
   return { gate: 'symbolic', ok: false, details: `Z3 found a disagreeing case (SAT model): ${counterexample}` }
 }
 
-export async function verifyInstructionCandidate(x86Instruction: string, candidate: string): Promise<GateCheckResult[]> {
+// ARM64 register names and mnemonics are case-insensitive in real assembly
+// (weaker local models sometimes emit lowercase, e.g. "ldr x0, [x1, ...]"),
+// so verification normalizes to uppercase once here before any gate parses
+// or compares it - every check below sees consistent-case text. This is
+// case-FOLDING for verification only: the candidate returned to the caller
+// (CeilingSuccess.result, CeilingAttempt.candidate) stays exactly as the
+// model produced it, so reports show what the model actually said.
+const CONDITION_CODES = Object.values(JCC_CONDITIONS)
+
+function checkStaticShape(candidate: string): GateCheckResult {
   const lines = candidate
     .split('\n')
     .map((l) => l.trim())
     .filter((l) => l.length > 0)
-  const staticGate: GateCheckResult =
-    lines.length === 0
-      ? { gate: 'static', ok: false, details: 'candidate is empty' }
-      : { gate: 'static', ok: true, details: `${lines.length} non-blank line(s)` }
+  if (lines.length === 0) {
+    return { gate: 'static', ok: false, details: 'candidate is empty' }
+  }
 
-  return [staticGate, checkRegisterTokenValidity(candidate), await checkSymbolicEquivalence(x86Instruction, candidate)]
+  for (const line of lines) {
+    const opcode = (line.split(/\s+/)[0] ?? '').toUpperCase()
+    for (const cond of CONDITION_CODES) {
+      if (opcode === `B${cond}`) {
+        return {
+          gate: 'static',
+          ok: false,
+          details: `malformed conditional branch mnemonic "${opcode}" in "${line}" - ARM64 requires dot notation: "B.${cond}"`,
+        }
+      }
+    }
+  }
+
+  return { gate: 'static', ok: true, details: `${lines.length} non-blank line(s), no malformed branch mnemonics` }
+}
+
+export async function verifyInstructionCandidate(x86Instruction: string, candidate: string): Promise<GateCheckResult[]> {
+  const normalized = candidate.toUpperCase()
+
+  return [checkStaticShape(normalized), checkRegisterTokenValidity(normalized), await checkSymbolicEquivalence(x86Instruction, normalized)]
 }
 
 // ---------------------------------------------------------------------------

@@ -228,11 +228,17 @@ const POP_ARM64_PATTERN = /^LDR\s+(\S+),\s*\[SP\],\s*#(-?\d+)$/
 
 type CandidateResolution = { ok: true; text: string } | { ok: false; details: string }
 
+// ARM64 register names and mnemonics are case-insensitive in real assembly;
+// normalizing here (rather than trusting every caller to pre-uppercase)
+// means every check below sees consistent-case text regardless of which
+// case a candidate override was written in. The real-pipeline path
+// (translateX86ToArm64) is already uppercase, so this is a harmless no-op
+// there - it only matters for arbitrary candidate text, e.g. from an LLM.
 function resolveCandidate(x86Line: string, candidateOverride: string | undefined): CandidateResolution {
-  if (candidateOverride !== undefined) return { ok: true, text: candidateOverride }
+  if (candidateOverride !== undefined) return { ok: true, text: candidateOverride.toUpperCase() }
   const translated = translateX86ToArm64(x86Line)
   if (!translated.ok) return { ok: false, details: `pipeline failed to translate "${x86Line}": ${translated.error}` }
-  return { ok: true, text: translated.instruction }
+  return { ok: true, text: translated.instruction.toUpperCase() }
 }
 
 export async function checkPushEquivalence(x86Line: string, candidateOverride?: string): Promise<GateResult> {
