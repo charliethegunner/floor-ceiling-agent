@@ -96,7 +96,7 @@ function resolveOperand(operand: string): OperandResolution {
   return { ok: false, error: `invalid operand: ${operand}` }
 }
 
-const LABEL_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
+export const LABEL_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 function resolveJumpTarget(operand: string): OperandResolution {
   const upper = operand.toUpperCase()
@@ -142,7 +142,7 @@ function buildSibLoad(dstValue: string, sib: SibOperand): TranslationSuccess {
 const SUPPORTED_OPCODES = ['MOV', 'ADD', 'CMP', 'PUSH', 'POP', 'CALL', 'JE', 'JNE', 'JG', 'JL', 'JGE', 'JLE'] as const
 type SupportedOpcode = (typeof SUPPORTED_OPCODES)[number]
 
-const JCC_CONDITIONS: Record<string, string> = {
+export const JCC_CONDITIONS: Record<string, string> = {
   JE: 'EQ',
   JNE: 'NE',
   JG: 'GT',
@@ -160,12 +160,14 @@ interface ParsedInstruction {
   operands: string[]
 }
 
-function parseInstruction(input: string): ParsedInstruction | null {
+export function parseInstruction(input: string): ParsedInstruction | null {
   const trimmed = input.trim()
   if (trimmed.length === 0) return null
 
   const firstSpace = trimmed.indexOf(' ')
-  if (firstSpace === -1) return null
+  if (firstSpace === -1) {
+    return { opcode: trimmed.toUpperCase(), operands: [] }
+  }
 
   const opcode = trimmed.slice(0, firstSpace).toUpperCase()
   const operands = trimmed
