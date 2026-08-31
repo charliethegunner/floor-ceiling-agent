@@ -46,21 +46,18 @@ export async function runVerificationFloor<Candidate, GateName extends string = 
 }
 
 // ---------------------------------------------------------------------------
-// Placeholder interfaces for domains not yet implemented. Deliberately just
-// markers conforming to VerificationFloor<Candidate, GateName> - no domain
-// logic is invented here, since neither engine's actual verification
-// semantics (what a "candidate" is, what its gates check) has been
-// specified yet. Each becomes a real floor by supplying `gates` once that
-// spec exists; nothing in CeilingAgent's orchestration loop needs to change
-// when it does, since it already knows only the generic contract above.
+// Placeholder interface for a domain not yet implemented. Deliberately just
+// a marker conforming to VerificationFloor<Candidate, GateName> - no domain
+// logic is invented here, since this engine's actual verification semantics
+// (what a "candidate" is, what its gates check) hasn't been specified yet.
+// It becomes a real floor by supplying `gates` once that spec exists;
+// nothing in CeilingAgent's orchestration loop needs to change when it does,
+// since it already knows only the generic contract above.
+//
+// The Topology Engine's placeholder that used to live here is gone: Phase
+// 4.1 (src/topology-floor.ts) implemented it for real, so a vague stub
+// alongside a concrete floor would just be dead weight.
 // ---------------------------------------------------------------------------
-
-export interface TopologyEngineCandidate {
-  readonly domain: 'topology'
-  readonly data: unknown
-}
-
-export type TopologyEngineFloor = VerificationFloor<TopologyEngineCandidate>
 
 export interface ClaimVerificationCandidate {
   readonly domain: 'claim-verification'
