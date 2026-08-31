@@ -80,6 +80,8 @@ export interface CeilingSuccess {
   result: string
   attempts: number
   gates: GateCheckResult[]
+  /** Attempts rejected before the successful one, in order. Empty on a first-try success. */
+  history: CeilingAttempt[]
 }
 
 export interface CeilingFailureReport {
@@ -375,7 +377,7 @@ export async function runCeilingAgent(request: CeilingRequest, llm: LlmClient, o
 
     const failedGate = gates.find((g) => !g.ok)
     if (!failedGate) {
-      return { ok: true, result: candidate, attempts: attempt, gates }
+      return { ok: true, result: candidate, attempts: attempt, gates, history: [...history] }
     }
     history.push({ attempt, candidate, failedGate })
   }
