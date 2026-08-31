@@ -59,7 +59,7 @@ function resolveOperand(operand: string): OperandResolution {
   return { ok: false, error: `invalid operand: ${operand}` }
 }
 
-const SUPPORTED_OPCODES = ['MOV', 'ADD'] as const
+const SUPPORTED_OPCODES = ['MOV', 'ADD', 'PUSH', 'POP'] as const
 type SupportedOpcode = (typeof SUPPORTED_OPCODES)[number]
 
 function isSupportedOpcode(opcode: string): opcode is SupportedOpcode {
@@ -90,13 +90,31 @@ function parseInstruction(input: string): ParsedInstruction | null {
 
 export function translateInstruction(input: string): TranslationResult {
   const parsed = parseInstruction(input)
-  if (!parsed || parsed.operands.length !== 2) {
+  if (!parsed) {
     return { ok: false, error: `invalid instruction format: "${input}"` }
   }
 
   const { opcode, operands } = parsed
   if (!isSupportedOpcode(opcode)) {
     return { ok: false, error: `unsupported opcode: ${opcode}` }
+  }
+
+  if (opcode === 'PUSH' || opcode === 'POP') {
+    if (operands.length !== 1) {
+      return { ok: false, error: `invalid instruction format: "${input}"` }
+    }
+    const operand = resolveOperand(operands[0])
+    if (!operand.ok) return operand
+    if (operand.kind !== 'register') {
+      return { ok: false, error: `${opcode} operand must be a register: ${operands[0]}` }
+    }
+    return opcode === 'PUSH'
+      ? { ok: true, instruction: `STR ${operand.value}, [SP, #-8]!` }
+      : { ok: true, instruction: `LDR ${operand.value}, [SP], #8` }
+  }
+
+  if (operands.length !== 2) {
+    return { ok: false, error: `invalid instruction format: "${input}"` }
   }
 
   const dst = resolveOperand(operands[0])

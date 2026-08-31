@@ -242,3 +242,56 @@ describe('translateInstruction with indirect memory store operands', () => {
     })
   })
 })
+
+describe('translateInstruction with stack push/pop operations', () => {
+  test('translates PUSH RAX to a pre-indexed STR', () => {
+    const result = translateInstruction('PUSH RAX')
+
+    expect(result).toEqual({ ok: true, instruction: 'STR X0, [SP, #-8]!' })
+  })
+
+  test('translates PUSH RBP to a pre-indexed STR', () => {
+    const result = translateInstruction('PUSH RBP')
+
+    expect(result).toEqual({ ok: true, instruction: 'STR FP, [SP, #-8]!' })
+  })
+
+  test('translates POP RBX to a post-indexed LDR', () => {
+    const result = translateInstruction('POP RBX')
+
+    expect(result).toEqual({ ok: true, instruction: 'LDR X1, [SP], #8' })
+  })
+
+  test('translates POP RAX to a post-indexed LDR', () => {
+    const result = translateInstruction('POP RAX')
+
+    expect(result).toEqual({ ok: true, instruction: 'LDR X0, [SP], #8' })
+  })
+
+  test('returns an error for PUSH with an immediate operand', () => {
+    const result = translateInstruction('PUSH 42')
+
+    expect(result).toEqual({ ok: false, error: 'PUSH operand must be a register: 42' })
+  })
+
+  test('returns an error for PUSH with an indirect memory operand', () => {
+    const result = translateInstruction('PUSH [RAX]')
+
+    expect(result).toEqual({ ok: false, error: 'PUSH operand must be a register: [RAX]' })
+  })
+
+  test('returns an error for PUSH with no operands', () => {
+    const result = translateInstruction('PUSH')
+
+    expect(result).toEqual({ ok: false, error: 'invalid instruction format: "PUSH"' })
+  })
+
+  test('returns an error for POP with too many operands', () => {
+    const result = translateInstruction('POP RAX, RBX')
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'invalid instruction format: "POP RAX, RBX"',
+    })
+  })
+})
