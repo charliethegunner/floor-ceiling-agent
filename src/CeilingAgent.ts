@@ -178,7 +178,7 @@ async function checkSymbolicEquivalence(x86Instruction: string, candidate: strin
     }
   }
 
-  const [dstTok, srcTok] = parsedX86.operands
+  const [dstTok, srcTok] = parsedX86.operands.map((operand) => operand.toUpperCase())
   if (!isKnownX86Register(dstTok) || !isKnownX86Register(srcTok)) {
     return { gate: 'symbolic', ok: true, details: 'operands are not both plain registers - symbolic check skipped' }
   }
@@ -288,7 +288,7 @@ async function checkSymbolicEquivalence(x86Instruction: string, candidate: strin
   return { gate: 'symbolic', ok: false, details: `Z3 found a disagreeing case (SAT model): ${counterexample}` }
 }
 
-async function verifyInstructionCandidate(x86Instruction: string, candidate: string): Promise<GateCheckResult[]> {
+export async function verifyInstructionCandidate(x86Instruction: string, candidate: string): Promise<GateCheckResult[]> {
   const lines = candidate
     .split('\n')
     .map((l) => l.trim())
