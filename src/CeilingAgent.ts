@@ -234,7 +234,9 @@ async function checkSymbolicEquivalence(x86Instruction: string, candidate: strin
     armPost = armPre[s]
   } else {
     const armOp = parsedArm.opcode.toUpperCase()
-    const expectedOp = { add: 'ADD', sub: 'SUB', and: 'AND', or: 'OR', xor: 'XOR' }[semantics]
+    // ADD/SUB/AND share their x86 mnemonic on ARM64; bitwise OR/XOR do not -
+    // ARM64 spells them ORR and EOR respectively.
+    const expectedOp = { add: 'ADD', sub: 'SUB', and: 'AND', or: 'ORR', xor: 'EOR' }[semantics]
     if (armOp !== expectedOp || parsedArm.operands.length !== 3) {
       return {
         gate: 'symbolic',
