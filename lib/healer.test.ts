@@ -59,8 +59,8 @@ describe('probeEnvironment', () => {
 describe('executeSelfHealingLoop', () => {
   beforeEach(() => {
     healerState.cache.clear()
-    healerState.lotSize = 0.02
-    delete process.env.LOT_SIZE
+    healerState.config = 1
+    delete process.env.HEALER_CONFIG_VALUE
   })
 
   test('returns healthy immediately when the operation succeeds on the first try', () => {
@@ -91,22 +91,22 @@ describe('executeSelfHealingLoop', () => {
   })
 
   test('applies a resolution strategy and succeeds on retry, reporting degraded', () => {
-    healerState.lotSize = 5
+    healerState.config = 5
 
     const result = executeSelfHealingLoop(() => {
-      if (healerState.lotSize !== 0.02) {
-        throw new Error('lot size is corrupted')
+      if (healerState.config !== 1) {
+        throw new Error('configuration is corrupted')
       }
     }, {
       strategies: [
-        { name: 'reset lot size to default (0.02)', apply: () => { healerState.lotSize = 0.02 } },
+        { name: 'reset configuration to default', apply: () => { healerState.config = 1 } },
       ],
       maxAttempts: 3,
     })
 
     expect(result.status).toBe('degraded')
     expect(result.issues).toHaveLength(1)
-    expect(result.autoFixesApplied).toEqual(['reset lot size to default (0.02)'])
+    expect(result.autoFixesApplied).toEqual(['reset configuration to default'])
   })
 
   test('applies registered strategies in order across successive failures', () => {
@@ -154,8 +154,8 @@ describe('executeSelfHealingLoop', () => {
 describe('defaultStrategies', () => {
   beforeEach(() => {
     healerState.cache.clear()
-    healerState.lotSize = 0.02
-    delete process.env.LOT_SIZE
+    healerState.config = 1
+    delete process.env.HEALER_CONFIG_VALUE
   })
 
   test('flush state cache strategy clears healerState.cache', () => {
@@ -167,21 +167,21 @@ describe('defaultStrategies', () => {
     expect(healerState.cache.size).toBe(0)
   })
 
-  test('reset lot size strategy resets healerState.lotSize to 0.02', () => {
-    healerState.lotSize = 123
-    const strategy = defaultStrategies.find((s) => s.name === 'reset lot size to default (0.02)')
+  test('reset configuration strategy resets healerState.config to the default', () => {
+    healerState.config = 123
+    const strategy = defaultStrategies.find((s) => s.name === 'reset configuration to default')
 
     strategy?.apply()
 
-    expect(healerState.lotSize).toBe(0.02)
+    expect(healerState.config).toBe(1)
   })
 
-  test('correct environment variables strategy removes an invalid LOT_SIZE', () => {
-    process.env.LOT_SIZE = 'not-a-number'
+  test('correct environment variables strategy removes an invalid HEALER_CONFIG_VALUE', () => {
+    process.env.HEALER_CONFIG_VALUE = 'not-a-number'
     const strategy = defaultStrategies.find((s) => s.name === 'correct environment variables')
 
     strategy?.apply()
 
-    expect(process.env.LOT_SIZE).toBeUndefined()
+    expect(process.env.HEALER_CONFIG_VALUE).toBeUndefined()
   })
 })

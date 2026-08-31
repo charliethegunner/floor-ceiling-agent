@@ -19,12 +19,15 @@ export interface ResolutionStrategy {
 
 export interface HealerState {
   cache: Map<string, unknown>
-  lotSize: number
+  config: number
 }
+
+const DEFAULT_CONFIG_VALUE = 1
+const CONFIG_ENV_VAR = 'HEALER_CONFIG_VALUE'
 
 export const healerState: HealerState = {
   cache: new Map(),
-  lotSize: 0.02,
+  config: DEFAULT_CONFIG_VALUE,
 }
 
 export const defaultStrategies: ResolutionStrategy[] = [
@@ -37,15 +40,16 @@ export const defaultStrategies: ResolutionStrategy[] = [
   {
     name: 'correct environment variables',
     apply: () => {
-      if (process.env.LOT_SIZE !== undefined && Number.isNaN(Number(process.env.LOT_SIZE))) {
-        delete process.env.LOT_SIZE
+      const raw = process.env[CONFIG_ENV_VAR]
+      if (raw !== undefined && Number.isNaN(Number(raw))) {
+        delete process.env[CONFIG_ENV_VAR]
       }
     },
   },
   {
-    name: 'reset lot size to default (0.02)',
+    name: 'reset configuration to default',
     apply: () => {
-      healerState.lotSize = 0.02
+      healerState.config = DEFAULT_CONFIG_VALUE
     },
   },
 ]
