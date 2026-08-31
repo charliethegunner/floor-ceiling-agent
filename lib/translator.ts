@@ -80,8 +80,17 @@ function resolveJumpTarget(operand: string): OperandResolution {
   return { ok: true, kind: 'label', value: operand }
 }
 
-const SUPPORTED_OPCODES = ['MOV', 'ADD', 'CMP', 'PUSH', 'POP', 'CALL', 'JE', 'JNE'] as const
+const SUPPORTED_OPCODES = ['MOV', 'ADD', 'CMP', 'PUSH', 'POP', 'CALL', 'JE', 'JNE', 'JG', 'JL', 'JGE', 'JLE'] as const
 type SupportedOpcode = (typeof SUPPORTED_OPCODES)[number]
+
+const JCC_CONDITIONS: Record<string, string> = {
+  JE: 'EQ',
+  JNE: 'NE',
+  JG: 'GT',
+  JL: 'LT',
+  JGE: 'GE',
+  JLE: 'LE',
+}
 
 function isSupportedOpcode(opcode: string): opcode is SupportedOpcode {
   return (SUPPORTED_OPCODES as readonly string[]).includes(opcode)
@@ -149,7 +158,7 @@ export function translateInstruction(input: string): TranslationResult {
     return { ok: true, instruction: `BL ${target}` }
   }
 
-  if (opcode === 'JE' || opcode === 'JNE') {
+  if (opcode in JCC_CONDITIONS) {
     if (operands.length !== 1) {
       return { ok: false, error: `invalid instruction format: "${input}"` }
     }
@@ -158,7 +167,7 @@ export function translateInstruction(input: string): TranslationResult {
     if (target.kind !== 'label') {
       return { ok: false, error: `invalid jump target: ${operands[0]}` }
     }
-    return { ok: true, instruction: `${opcode === 'JE' ? 'B.EQ' : 'B.NE'} ${target.value}` }
+    return { ok: true, instruction: `B.${JCC_CONDITIONS[opcode]} ${target.value}` }
   }
 
   if (operands.length !== 2) {

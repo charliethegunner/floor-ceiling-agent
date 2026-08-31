@@ -423,3 +423,59 @@ describe('translateInstruction with CMP and conditional branches', () => {
     expect(result).toEqual({ ok: true, instruction: 'ADD X0, X0, X1' })
   })
 })
+
+describe('translateInstruction with signed relational Jcc', () => {
+  test('translates JG to B.GT', () => {
+    const result = translateInstruction('JG greater')
+
+    expect(result).toEqual({ ok: true, instruction: 'B.GT greater' })
+  })
+
+  test('translates JL to B.LT', () => {
+    const result = translateInstruction('JL less')
+
+    expect(result).toEqual({ ok: true, instruction: 'B.LT less' })
+  })
+
+  test('translates JGE to B.GE', () => {
+    const result = translateInstruction('JGE greater_or_equal')
+
+    expect(result).toEqual({ ok: true, instruction: 'B.GE greater_or_equal' })
+  })
+
+  test('translates JLE to B.LE', () => {
+    const result = translateInstruction('JLE less_or_equal')
+
+    expect(result).toEqual({ ok: true, instruction: 'B.LE less_or_equal' })
+  })
+
+  test('is case-insensitive for the opcode but preserves label case verbatim', () => {
+    const result = translateInstruction('jge Loop')
+
+    expect(result).toEqual({ ok: true, instruction: 'B.GE Loop' })
+  })
+
+  test('rejects a register as a jump target for JG', () => {
+    const result = translateInstruction('JG RAX')
+
+    expect(result).toEqual({ ok: false, error: 'invalid jump target: RAX' })
+  })
+
+  test('rejects JLE with no operand', () => {
+    const result = translateInstruction('JLE')
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'invalid instruction format: "JLE"',
+    })
+  })
+
+  test('rejects JG with too many operands', () => {
+    const result = translateInstruction('JG label1, label2')
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'invalid instruction format: "JG label1, label2"',
+    })
+  })
+})
