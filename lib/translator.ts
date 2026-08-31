@@ -96,6 +96,44 @@ function resolveOperand(operand: string): OperandResolution {
   return { ok: false, error: `invalid operand: ${operand}` }
 }
 
+export type X86OperandClass =
+  | { kind: 'register'; name: X86Register }
+  | { kind: 'immediate' }
+  | { kind: 'memory'; base: X86Register; index?: X86Register }
+  | { kind: 'unresolved' }
+
+export function classifyX86Operand(operand: string): X86OperandClass {
+  const upper = operand.toUpperCase()
+  if (isX86Register(upper)) {
+    return { kind: 'register', name: upper }
+  }
+  if (/^-?\d+$/.test(operand)) {
+    return { kind: 'immediate' }
+  }
+  if (operand.startsWith('[')) {
+    const sibMatch = SIB_OPERAND_PATTERN.exec(operand)
+    if (sibMatch) {
+      const [, baseRaw, indexRaw] = sibMatch
+      const baseName = baseRaw.toUpperCase()
+      const indexName = indexRaw.toUpperCase()
+      if (!isX86Register(baseName) || !isX86Register(indexName)) {
+        return { kind: 'unresolved' }
+      }
+      if (indexName === 'RSP') {
+        return { kind: 'unresolved' }
+      }
+      return { kind: 'memory', base: baseName, index: indexName }
+    }
+    const match = MEMORY_OPERAND_PATTERN.exec(operand)
+    const baseName = match?.[1].toUpperCase()
+    if (!match || !baseName || !isX86Register(baseName)) {
+      return { kind: 'unresolved' }
+    }
+    return { kind: 'memory', base: baseName }
+  }
+  return { kind: 'unresolved' }
+}
+
 export const LABEL_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 function resolveJumpTarget(operand: string): OperandResolution {
