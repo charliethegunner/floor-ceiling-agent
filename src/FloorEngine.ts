@@ -2,7 +2,22 @@ import { Project, SyntaxKind } from 'ts-morph'
 import fc from 'fast-check'
 import { init } from 'z3-solver'
 import { translateX86ToArm64 } from '../lib/index'
-import { X86Register, registerMap, parseInstruction } from '../lib/translator'
+import { X86Register, registerMap, parseInstruction, parseX86MemoryOperand } from '../lib/translator'
+
+// z3-solver's init() instantiates a fresh WASM module (allocating its own
+// linear memory) on every call. runSymbolicGate can invoke a dozen+ checks
+// in one run, and repeated fresh instantiations exhaust available WASM
+// memory under Node - so the (expensive) module init is memoized once per
+// process, while Context(name) - proven safe to call repeatedly with the
+// same name across many independent checks - stays fresh per check.
+let z3Module: ReturnType<typeof init> | undefined
+
+function getZ3(): ReturnType<typeof init> {
+  if (z3Module === undefined) {
+    z3Module = init()
+  }
+  return z3Module
+}
 
 export interface GateResult {
   gate: 'static' | 'fuzz' | 'symbolic'
@@ -240,7 +255,7 @@ export async function checkPushEquivalence(x86Line: string, candidateOverride?: 
     return { gate: 'symbolic', ok: false, details: `expected destination register ${armReg}, got ${candReg}` }
   }
 
-  const { Context } = await init()
+  const { Context } = await getZ3()
   const { Solver, BitVec, Array: Z3Array, Or } = Context('floor-engine-stack')
   const rsp = BitVec.const('rsp', 64)
   const regVal = BitVec.const('regVal', 64)
@@ -286,7 +301,7 @@ export async function checkPopEquivalence(x86Line: string, candidateOverride?: s
     return { gate: 'symbolic', ok: false, details: `expected destination register ${armReg}, got ${candReg}` }
   }
 
-  const { Context } = await init()
+  const { Context } = await getZ3()
   const { Solver, BitVec, Array: Z3Array, Or } = Context('floor-engine-stack')
   const rsp = BitVec.const('rsp', 64)
   const mem = Z3Array.const('mem', BitVec.sort(64), BitVec.sort(64))
@@ -340,7 +355,7 @@ export async function checkPushPopRoundTrip(register: X86Register, candidateOver
     return { gate: 'symbolic', ok: false, details: `expected both lines to reference ${armReg}, got push=${pushReg} pop=${popReg}` }
   }
 
-  const { Context } = await init()
+  const { Context } = await getZ3()
   const { Solver, BitVec, Array: Z3Array, Or } = Context('floor-engine-stack')
   const rsp = BitVec.const('rsp', 64)
   const regVal = BitVec.const('regVal', 64)
@@ -367,11 +382,183 @@ export async function checkPushPopRoundTrip(register: X86Register, candidateOver
   }
 }
 
+// ---------------------------------------------------------------------------
+// Gate 3, Phase 1b: SIB addressing (base + index*scale + displacement) and
+// plain memory displacements for MOV load/store.
+//
+// The interesting bug surface here is address computation, not memory
+// theory, so the proof target is address equivalence: the x86 ground-truth
+// address is base + index*scale + disp using x86's own SIB definition
+// (scale as a multiplier); the ARM64 candidate's address is reconstructed
+// from its own text using ARM64's actual instruction (LSL as a shift, plus
+// - for the SIB-with-displacement case - the scratch-register ADD SPEC-008
+// introduced). Proving `index.mul(scale) == index.shl(shift)` for the
+// correct shift is exactly re-verifying SPEC-008's SCALE_TO_SHIFT table
+// symbolically, not just against the fixed examples in translator.test.ts.
+// Both are then folded into a Select/Store equivalence proof (matching the
+// Phase 1 PUSH/POP style) so a wrong address is a genuine Z3 disagreement,
+// not a string comparison.
+// ---------------------------------------------------------------------------
+
+const LOAD_STORE_SIB_PATTERN = /^(LDR|STR)\s+(\S+),\s*\[(\S+),\s*(\S+),\s*LSL\s*#(\d+)\]$/
+const LOAD_STORE_PLAIN_PATTERN = /^(LDR|STR)\s+(\S+),\s*\[(\S+)(?:,\s*#(-?\d+))?\]$/
+const ADD_SCRATCH_PATTERN = /^ADD\s+(\S+),\s*(\S+),\s*#(-?\d+)$/
+const SIB_SCRATCH_REGISTER = 'X9'
+
+interface CandidateMemoryAddress {
+  opcode: 'LDR' | 'STR'
+  reg: string
+  base: string
+  index?: string
+  shift?: number
+  disp: number
+}
+
+function parseCandidateMemoryLines(lines: string[]): { ok: true; value: CandidateMemoryAddress } | { ok: false; details: string } {
+  if (lines.length === 1) {
+    const sibMatch = LOAD_STORE_SIB_PATTERN.exec(lines[0])
+    if (sibMatch) {
+      const [, opcode, reg, base, index, shift] = sibMatch
+      return { ok: true, value: { opcode: opcode as 'LDR' | 'STR', reg, base, index, shift: Number(shift), disp: 0 } }
+    }
+    const plainMatch = LOAD_STORE_PLAIN_PATTERN.exec(lines[0])
+    if (plainMatch) {
+      const [, opcode, reg, base, dispText] = plainMatch
+      return { ok: true, value: { opcode: opcode as 'LDR' | 'STR', reg, base, disp: dispText ? Number(dispText) : 0 } }
+    }
+    return { ok: false, details: `could not parse memory instruction shape: "${lines[0]}"` }
+  }
+  if (lines.length === 2) {
+    const addMatch = ADD_SCRATCH_PATTERN.exec(lines[0])
+    const sibMatch = LOAD_STORE_SIB_PATTERN.exec(lines[1])
+    if (!addMatch || !sibMatch) {
+      return { ok: false, details: `expected a scratch-register ADD followed by a SIB LDR/STR, got: "${lines.join(' | ')}"` }
+    }
+    const [, scratchDst, addBase, addDisp] = addMatch
+    const [, opcode, reg, sibBase, index, shift] = sibMatch
+    if (scratchDst !== SIB_SCRATCH_REGISTER || sibBase !== SIB_SCRATCH_REGISTER) {
+      return { ok: false, details: `expected the scratch register to be ${SIB_SCRATCH_REGISTER}, got: "${lines.join(' | ')}"` }
+    }
+    return {
+      ok: true,
+      value: { opcode: opcode as 'LDR' | 'STR', reg, base: addBase, index, shift: Number(shift), disp: Number(addDisp) },
+    }
+  }
+  return { ok: false, details: `expected 1 or 2 lines for a memory instruction, got ${lines.length}: "${lines.join(' | ')}"` }
+}
+
+function isKnownX86Register(name: string): name is X86Register {
+  return name in registerMap
+}
+
+export async function checkMemoryEquivalence(x86Instruction: string, candidateOverride?: string): Promise<GateResult> {
+  const parsedX86 = parseInstruction(x86Instruction)
+  if (!parsedX86 || parsedX86.opcode !== 'MOV' || parsedX86.operands.length !== 2) {
+    return { gate: 'symbolic', ok: false, details: `expected a 2-operand MOV instruction, got "${x86Instruction}"` }
+  }
+
+  const [op0, op1] = parsedX86.operands
+  const dstMem = parseX86MemoryOperand(op0)
+  const srcMem = parseX86MemoryOperand(op1)
+  if ((dstMem === null) === (srcMem === null)) {
+    return { gate: 'symbolic', ok: false, details: `expected exactly one memory operand in "${x86Instruction}"` }
+  }
+  const isStore = dstMem !== null
+  const memOperand = isStore ? dstMem : srcMem
+  const regTok = isStore ? op1 : op0
+  if (!isKnownX86Register(regTok)) {
+    return { gate: 'symbolic', ok: false, details: `expected a register operand alongside the memory operand in "${x86Instruction}"` }
+  }
+  if (!memOperand) {
+    return { gate: 'symbolic', ok: false, details: `internal error: memory operand missing for "${x86Instruction}"` }
+  }
+
+  const resolved = resolveCandidate(x86Instruction, candidateOverride)
+  if (!resolved.ok) return { gate: 'symbolic', ok: false, details: resolved.details }
+
+  const lines = resolved.text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+  const parsedCand = parseCandidateMemoryLines(lines)
+  if (!parsedCand.ok) return { gate: 'symbolic', ok: false, details: parsedCand.details }
+  const cand = parsedCand.value
+
+  const expectedOpcode = isStore ? 'STR' : 'LDR'
+  if (cand.opcode !== expectedOpcode) {
+    return { gate: 'symbolic', ok: false, details: `expected ${expectedOpcode}, got ${cand.opcode} in "${resolved.text}"` }
+  }
+  const armReg = registerMap[regTok]
+  if (cand.reg !== armReg) {
+    return { gate: 'symbolic', ok: false, details: `expected register ${armReg}, got ${cand.reg} in "${resolved.text}"` }
+  }
+  const armBase = registerMap[memOperand.base]
+  if (cand.base !== armBase) {
+    return { gate: 'symbolic', ok: false, details: `expected base register ${armBase}, got ${cand.base} in "${resolved.text}"` }
+  }
+  if (memOperand.index !== undefined) {
+    const armIndex = registerMap[memOperand.index]
+    if (cand.index !== armIndex) {
+      return { gate: 'symbolic', ok: false, details: `expected index register ${armIndex}, got ${cand.index ?? '(none)'} in "${resolved.text}"` }
+    }
+  } else if (cand.index !== undefined) {
+    return { gate: 'symbolic', ok: false, details: `unexpected index register ${cand.index} in "${resolved.text}"` }
+  }
+
+  const { Context } = await getZ3()
+  const { Solver, BitVec, Array: Z3Array } = Context('floor-engine-memory')
+  const base = BitVec.const('base', 64)
+  const regVal = BitVec.const('regVal', 64)
+  const mem = Z3Array.const('mem', BitVec.sort(64), BitVec.sort(64))
+  const index = memOperand.index !== undefined ? BitVec.const('index', 64) : undefined
+
+  let x86Addr = base
+  if (index !== undefined && memOperand.scale !== undefined) x86Addr = x86Addr.add(index.mul(memOperand.scale))
+  if (memOperand.displacement !== 0) x86Addr = x86Addr.add(memOperand.displacement)
+
+  let candAddr = base
+  if (index !== undefined && cand.shift !== undefined) candAddr = candAddr.add(index.shl(cand.shift))
+  if (cand.disp !== 0) candAddr = candAddr.add(cand.disp)
+
+  const solver = new Solver()
+  const result = await (async () => {
+    if (isStore) {
+      solver.add(mem.store(x86Addr, regVal).neq(mem.store(candAddr, regVal)))
+    } else {
+      solver.add(mem.select(x86Addr).neq(mem.select(candAddr)))
+    }
+    return solver.check()
+  })()
+
+  if (result !== 'unsat') {
+    return {
+      gate: 'symbolic',
+      ok: false,
+      details: `Z3 disproved memory ${isStore ? 'store' : 'load'} equivalence for "${x86Instruction}" -> "${resolved.text}" (${result})`,
+    }
+  }
+  return {
+    gate: 'symbolic',
+    ok: true,
+    details: `Z3 proved "${x86Instruction}" -> "${resolved.text}" computes the same effective address and ${isStore ? 'resulting memory state' : 'loaded value'} for all possible register values`,
+  }
+}
+
 const STACK_CASES = ['PUSH RAX', 'PUSH RDI', 'POP RBX', 'POP RCX']
 const ROUND_TRIP_REGISTERS: X86Register[] = ['RAX', 'RDI']
+const MEMORY_CASES = [
+  'MOV RAX, [RBX]',
+  'MOV [RBX], RAX',
+  'MOV RAX, [RBX + 16]',
+  'MOV [RBX + 16], RAX',
+  'MOV RAX, [RBX + RCX*4]',
+  'MOV [RBX + RCX*4], RAX',
+  'MOV RAX, [RBX + RCX*4 + 32]',
+  'MOV [RBX + RCX*4 + 32], RAX',
+]
 
 export async function runSymbolicGate(): Promise<GateResult> {
-  const { Context } = await init()
+  const { Context } = await getZ3()
   const { Solver, BitVec, Or } = Context('floor-engine')
   const WIDTH = 64
 
@@ -432,14 +619,18 @@ export async function runSymbolicGate(): Promise<GateResult> {
     const result = await checkPushPopRoundTrip(register)
     if (!result.ok) return result
   }
+  for (const x86Line of MEMORY_CASES) {
+    const result = await checkMemoryEquivalence(x86Line)
+    if (!result.ok) return result
+  }
 
   return {
     gate: 'symbolic',
     ok: true,
     details:
       `Z3 proved register-file equivalence for ${EQUIVALENCE_CASES.length} MOV/ADD/CMP cases, ` +
-      `${STACK_CASES.length} PUSH/POP stack transitions, and ${ROUND_TRIP_REGISTERS.length} PUSH/POP round trips, ` +
-      'all across every possible 64-bit value',
+      `${STACK_CASES.length} PUSH/POP stack transitions, ${ROUND_TRIP_REGISTERS.length} PUSH/POP round trips, and ` +
+      `${MEMORY_CASES.length} SIB/displacement memory load-store cases, all across every possible 64-bit value`,
   }
 }
 

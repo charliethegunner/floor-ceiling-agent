@@ -134,6 +134,46 @@ export function classifyX86Operand(operand: string): X86OperandClass {
   return { kind: 'unresolved' }
 }
 
+export interface X86MemoryOperand {
+  base: X86Register
+  index?: X86Register
+  scale?: 1 | 2 | 4 | 8
+  displacement: number
+}
+
+/**
+ * Full address-computation detail for a memory/SIB operand, at x86 register
+ * granularity - unlike classifyX86Operand, which deliberately drops scale
+ * and displacement (liveness only needs to know which registers are
+ * referenced). Reuses the same MEMORY_OPERAND_PATTERN/SIB_OPERAND_PATTERN
+ * grammar, no duplication.
+ */
+export function parseX86MemoryOperand(operand: string): X86MemoryOperand | null {
+  if (!operand.startsWith('[')) return null
+
+  const sibMatch = SIB_OPERAND_PATTERN.exec(operand)
+  if (sibMatch) {
+    const [, baseRaw, indexRaw, scale, sign, dispRaw] = sibMatch
+    const baseName = baseRaw.toUpperCase()
+    const indexName = indexRaw.toUpperCase()
+    if (!isX86Register(baseName) || !isX86Register(indexName) || indexName === 'RSP') return null
+    const magnitude = dispRaw ? (/^0x/i.test(dispRaw) ? parseInt(dispRaw, 16) : parseInt(dispRaw, 10)) : 0
+    return {
+      base: baseName,
+      index: indexName,
+      scale: Number(scale) as 1 | 2 | 4 | 8,
+      displacement: sign === '-' ? -magnitude : magnitude,
+    }
+  }
+
+  const match = MEMORY_OPERAND_PATTERN.exec(operand)
+  const baseName = match?.[1].toUpperCase()
+  if (!match || !baseName || !isX86Register(baseName)) return null
+  const [, , sign, magnitudeRaw] = match
+  const magnitude = magnitudeRaw ? Number(magnitudeRaw) : 0
+  return { base: baseName, displacement: sign === '-' ? -magnitude : magnitude }
+}
+
 export const LABEL_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 function resolveJumpTarget(operand: string): OperandResolution {
