@@ -124,3 +124,68 @@ describe('translateInstruction', () => {
     })
   })
 })
+
+describe('translateInstruction with indirect memory operands', () => {
+  test('translates an indirect load with no offset to LDR', () => {
+    const result = translateInstruction('MOV RAX, [RBX]')
+
+    expect(result).toEqual({ ok: true, instruction: 'LDR X0, [X1]' })
+  })
+
+  test('translates an indirect load with a positive offset to LDR', () => {
+    const result = translateInstruction('MOV RAX, [RBX + 8]')
+
+    expect(result).toEqual({ ok: true, instruction: 'LDR X0, [X1, #8]' })
+  })
+
+  test('translates an indirect load with no spaces around the offset', () => {
+    const result = translateInstruction('MOV RAX, [RBX+8]')
+
+    expect(result).toEqual({ ok: true, instruction: 'LDR X0, [X1, #8]' })
+  })
+
+  test('translates an indirect load with a negative offset', () => {
+    const result = translateInstruction('MOV RAX, [RBX - 8]')
+
+    expect(result).toEqual({ ok: true, instruction: 'LDR X0, [X1, #-8]' })
+  })
+
+  test('is case-insensitive for registers inside a memory operand', () => {
+    const result = translateInstruction('mov rax, [rbx + 8]')
+
+    expect(result).toEqual({ ok: true, instruction: 'LDR X0, [X1, #8]' })
+  })
+
+  test('returns an error for an invalid base register in a memory operand', () => {
+    const result = translateInstruction('MOV RAX, [RZZ]')
+
+    expect(result).toEqual({ ok: false, error: 'invalid operand: [RZZ]' })
+  })
+
+  test('returns an error for a malformed memory operand', () => {
+    const result = translateInstruction('MOV RAX, [RBX +]')
+
+    expect(result).toEqual({ ok: false, error: 'invalid operand: [RBX +]' })
+  })
+
+  test('returns an error for an unclosed memory operand', () => {
+    const result = translateInstruction('MOV RAX, [RBX')
+
+    expect(result).toEqual({ ok: false, error: 'invalid operand: [RBX' })
+  })
+
+  test('returns an error when the destination is a memory reference', () => {
+    const result = translateInstruction('MOV [RBX], RAX')
+
+    expect(result).toEqual({ ok: false, error: 'destination must be a register: [RBX]' })
+  })
+
+  test('returns an error when a memory operand is used with an unsupported opcode', () => {
+    const result = translateInstruction('ADD RAX, [RBX]')
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'memory operand not supported for opcode: ADD',
+    })
+  })
+})

@@ -25,11 +25,14 @@ export type TranslationResult = TranslationSuccess | TranslationError
 type OperandResolution =
   | { ok: true; kind: 'register'; value: string }
   | { ok: true; kind: 'immediate'; value: string }
+  | { ok: true; kind: 'memory'; base: string; offset?: string }
   | { ok: false; error: string }
 
 function isX86Register(name: string): name is X86Register {
   return name in registerMap
 }
+
+const MEMORY_OPERAND_PATTERN = /^\[\s*([A-Za-z0-9]+)\s*(?:([+-])\s*(\d+))?\s*\]$/
 
 function resolveOperand(operand: string): OperandResolution {
   const upper = operand.toUpperCase()
@@ -38,6 +41,20 @@ function resolveOperand(operand: string): OperandResolution {
   }
   if (/^-?\d+$/.test(operand)) {
     return { ok: true, kind: 'immediate', value: `#${operand}` }
+  }
+  if (operand.startsWith('[')) {
+    const match = MEMORY_OPERAND_PATTERN.exec(operand)
+    const baseName = match?.[1].toUpperCase()
+    if (!match || !baseName || !isX86Register(baseName)) {
+      return { ok: false, error: `invalid operand: ${operand}` }
+    }
+    const [, , sign, magnitude] = match
+    return {
+      ok: true,
+      kind: 'memory',
+      base: registerMap[baseName],
+      offset: magnitude ? `${sign === '-' ? '-' : ''}${magnitude}` : undefined,
+    }
   }
   return { ok: false, error: `invalid operand: ${operand}` }
 }
@@ -84,12 +101,20 @@ export function translateInstruction(input: string): TranslationResult {
 
   const dst = resolveOperand(operands[0])
   if (!dst.ok) return dst
-  if (dst.kind === 'immediate') {
+  if (dst.kind !== 'register') {
     return { ok: false, error: `destination must be a register: ${operands[0]}` }
   }
 
   const src = resolveOperand(operands[1])
   if (!src.ok) return src
+
+  if (src.kind === 'memory') {
+    if (opcode !== 'MOV') {
+      return { ok: false, error: `memory operand not supported for opcode: ${opcode}` }
+    }
+    const offset = src.offset ? `, #${src.offset}` : ''
+    return { ok: true, instruction: `LDR ${dst.value}, [${src.base}${offset}]` }
+  }
 
   if (opcode === 'MOV') {
     return { ok: true, instruction: `MOV ${dst.value}, ${src.value}` }
