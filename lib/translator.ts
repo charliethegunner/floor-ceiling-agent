@@ -27,6 +27,7 @@ type OperandResolution =
   | { ok: true; kind: 'register'; value: string }
   | { ok: true; kind: 'immediate'; value: string }
   | { ok: true; kind: 'memory'; base: string; offset?: string }
+  | { ok: true; kind: 'label'; value: string }
   | { ok: false; error: string }
 
 function isX86Register(name: string): name is X86Register {
@@ -60,7 +61,26 @@ function resolveOperand(operand: string): OperandResolution {
   return { ok: false, error: `invalid operand: ${operand}` }
 }
 
-const SUPPORTED_OPCODES = ['MOV', 'ADD', 'PUSH', 'POP', 'CALL'] as const
+const LABEL_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+function resolveJumpTarget(operand: string): OperandResolution {
+  const upper = operand.toUpperCase()
+  if (isX86Register(upper)) {
+    return { ok: false, error: `invalid jump target: ${operand}` }
+  }
+  if (/^-?\d+$/.test(operand)) {
+    return { ok: false, error: `invalid jump target: ${operand}` }
+  }
+  if (operand.startsWith('[')) {
+    return { ok: false, error: `invalid jump target: ${operand}` }
+  }
+  if (!LABEL_PATTERN.test(operand)) {
+    return { ok: false, error: `invalid jump target: ${operand}` }
+  }
+  return { ok: true, kind: 'label', value: operand }
+}
+
+const SUPPORTED_OPCODES = ['MOV', 'ADD', 'CMP', 'PUSH', 'POP', 'CALL', 'JE', 'JNE'] as const
 type SupportedOpcode = (typeof SUPPORTED_OPCODES)[number]
 
 function isSupportedOpcode(opcode: string): opcode is SupportedOpcode {
@@ -129,6 +149,18 @@ export function translateInstruction(input: string): TranslationResult {
     return { ok: true, instruction: `BL ${target}` }
   }
 
+  if (opcode === 'JE' || opcode === 'JNE') {
+    if (operands.length !== 1) {
+      return { ok: false, error: `invalid instruction format: "${input}"` }
+    }
+    const target = resolveJumpTarget(operands[0])
+    if (!target.ok) return target
+    if (target.kind !== 'label') {
+      return { ok: false, error: `invalid jump target: ${operands[0]}` }
+    }
+    return { ok: true, instruction: `${opcode === 'JE' ? 'B.EQ' : 'B.NE'} ${target.value}` }
+  }
+
   if (operands.length !== 2) {
     return { ok: false, error: `invalid instruction format: "${input}"` }
   }
@@ -168,5 +200,9 @@ export function translateInstruction(input: string): TranslationResult {
     return { ok: true, instruction: `MOV ${dst.value}, ${src.value}` }
   }
 
-  return { ok: true, instruction: `ADD ${dst.value}, ${dst.value}, ${src.value}` }
+  if (opcode === 'ADD') {
+    return { ok: true, instruction: `ADD ${dst.value}, ${dst.value}, ${src.value}` }
+  }
+
+  return { ok: true, instruction: `CMP ${dst.value}, ${src.value}` }
 }

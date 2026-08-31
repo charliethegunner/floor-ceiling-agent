@@ -340,3 +340,86 @@ describe('translateInstruction with CALL', () => {
     })
   })
 })
+
+describe('translateInstruction with CMP and conditional branches', () => {
+  test('translates a register-to-register CMP', () => {
+    const result = translateInstruction('CMP RAX, RBX')
+
+    expect(result).toEqual({ ok: true, instruction: 'CMP X0, X1' })
+  })
+
+  test('translates a CMP with an immediate operand', () => {
+    const result = translateInstruction('CMP RCX, 5')
+
+    expect(result).toEqual({ ok: true, instruction: 'CMP X2, #5' })
+  })
+
+  test('translates JE to B.EQ', () => {
+    const result = translateInstruction('JE loop_start')
+
+    expect(result).toEqual({ ok: true, instruction: 'B.EQ loop_start' })
+  })
+
+  test('translates JNE to B.NE', () => {
+    const result = translateInstruction('JNE done')
+
+    expect(result).toEqual({ ok: true, instruction: 'B.NE done' })
+  })
+
+  test('is case-insensitive for the opcode but preserves label case verbatim', () => {
+    const result = translateInstruction('je Loop')
+
+    expect(result).toEqual({ ok: true, instruction: 'B.EQ Loop' })
+  })
+
+  test('rejects a CMP with a memory operand', () => {
+    const result = translateInstruction('CMP RAX, [RBX]')
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'memory operand not supported for opcode: CMP',
+    })
+  })
+
+  test('rejects a register as a jump target', () => {
+    const result = translateInstruction('JE RAX')
+
+    expect(result).toEqual({ ok: false, error: 'invalid jump target: RAX' })
+  })
+
+  test('rejects an immediate as a jump target', () => {
+    const result = translateInstruction('JE 5')
+
+    expect(result).toEqual({ ok: false, error: 'invalid jump target: 5' })
+  })
+
+  test('rejects a memory operand as a jump target', () => {
+    const result = translateInstruction('JE [RAX]')
+
+    expect(result).toEqual({ ok: false, error: 'invalid jump target: [RAX]' })
+  })
+
+  test('rejects JE with no operand', () => {
+    const result = translateInstruction('JE')
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'invalid instruction format: "JE"',
+    })
+  })
+
+  test('rejects JE with too many operands', () => {
+    const result = translateInstruction('JE label1, label2')
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'invalid instruction format: "JE label1, label2"',
+    })
+  })
+
+  test('regression: ADD still dispatches to ADD, not CMP', () => {
+    const result = translateInstruction('ADD RAX, RBX')
+
+    expect(result).toEqual({ ok: true, instruction: 'ADD X0, X0, X1' })
+  })
+})
