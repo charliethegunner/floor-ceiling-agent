@@ -1,5 +1,5 @@
-import { runVerificationFloor, type VerificationFloor, type FloorReport } from '../verification-floor'
-import type { SamplerConfig, Candidate, CandidateEvaluation, BestOfNResult } from './types'
+import { runVerificationFloor, type VerificationFloor, type FloorReport, type GateOutcome } from '../verification-floor'
+import type { SamplerConfig, Candidate, CandidateEvaluation, BestOfNResult, WorkerOffload } from './types'
 
 const DEFAULT_CONFIG: SamplerConfig = {
   sampleSize: 3,
@@ -16,9 +16,11 @@ const DEFAULT_CONFIG: SamplerConfig = {
 // passed in unchanged.
 export class ParallelCandidateSampler<TCandidate, GateName extends string = string> {
   private readonly config: SamplerConfig
+  private readonly workerOffload?: WorkerOffload<TCandidate>
 
-  constructor(config: Partial<SamplerConfig> = {}) {
+  constructor(config: Partial<SamplerConfig> = {}, workerOffload?: WorkerOffload<TCandidate>) {
     this.config = { ...DEFAULT_CONFIG, ...config }
+    this.workerOffload = workerOffload
   }
 
   private computeTemperatures(): number[] {
@@ -53,17 +55,50 @@ export class ParallelCandidateSampler<TCandidate, GateName extends string = stri
     const pending = temperatures.map((temperature, index) => evaluate(temperature, index))
     if (!this.config.earlyExitOnSuccess) return Promise.all(pending)
 
+    // A rejecting candidate (generatorFn or verification itself throwing -
+    // e.g. a real LLM network error, not just a failed verification) must
+    // still count toward `remaining` reaching 0, or a round where every
+    // candidate rejects would never resolve at all. Its rejection is
+    // deliberately swallowed here, not re-thrown: under earlyExitOnSuccess
+    // its result was always going to be discarded if a sibling candidate
+    // succeeded anyway, and an unhandled promise rejection is worse than
+    // silently excluding it from `settled`.
     return new Promise((resolve) => {
       const settled: CandidateEvaluation<TCandidate, GateName>[] = []
       let remaining = pending.length
       pending.forEach((promise) => {
-        promise.then((evalItem) => {
-          settled.push(evalItem)
-          remaining--
-          if (evalItem.report.ok || remaining === 0) resolve(settled)
-        })
+        promise
+          .then((evalItem) => {
+            settled.push(evalItem)
+            remaining--
+            if (evalItem.report.ok || remaining === 0) resolve(settled)
+          })
+          .catch(() => {
+            remaining--
+            if (remaining === 0) resolve(settled)
+          })
       })
     })
+  }
+
+  // Routes through WorkerPoolEvaluator when workerOffload is configured AND
+  // toTask can express this candidate as a worker task; otherwise (no
+  // offload configured, toTask returns null, or the pool itself falls back
+  // internally - a dead worker, a timeout, pool shutdown) runs the SAME
+  // in-process runVerificationFloor path as before Phase 9. Callers that
+  // never pass workerOffload get byte-identical behavior to pre-Phase-9.
+  private async runFloor(floor: VerificationFloor<TCandidate, GateName>, payload: TCandidate): Promise<FloorReport<GateName>> {
+    const fallback = () => runVerificationFloor(floor, payload)
+
+    if (this.workerOffload) {
+      const task = this.workerOffload.toTask(payload)
+      if (task) {
+        const gates = await this.workerOffload.pool.verify(task, async () => (await fallback()).gates)
+        return { ok: gates.every((g) => g.ok), domain: floor.domain, gates: gates as GateOutcome<GateName>[] }
+      }
+    }
+
+    return fallback()
   }
 
   async evaluateBestOfN(
@@ -77,7 +112,7 @@ export class ParallelCandidateSampler<TCandidate, GateName extends string = stri
       const payload = await generatorFn(temperature, index)
       const candidate: Candidate<TCandidate> = { index, temperature, payload }
       const gateStart = Date.now()
-      const report = await runVerificationFloor(floor, payload)
+      const report = await this.runFloor(floor, payload)
       const elapsedMs = Date.now() - gateStart
       return { candidate, report, score: this.score(report, elapsedMs), elapsedMs }
     }

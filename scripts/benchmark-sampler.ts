@@ -3,6 +3,7 @@ import { translateInstruction, type X86Register } from '../lib/translator'
 import type { TopologyCandidate } from '../src/topology-floor'
 import type { ClaimCandidate } from '../src/claim-floor'
 import type { SpatialCandidate } from '../src/spatial-floor'
+import { WorkerPoolEvaluator } from '../src/layer1/worker-pool'
 
 // ---------------------------------------------------------------------------
 // Synthetic (NOT live-model) benchmark: isolates and measures Best-of-N
@@ -197,7 +198,15 @@ const DOMAIN_TASK_BUILDERS: Record<string, () => Task[]> = {
 // Execution and metrics
 // ---------------------------------------------------------------------------
 
-type Strategy = 'single-shot' | 'best-of-n'
+// 'best-of-n-workers' exists specifically to answer the question this whole
+// phase was commissioned to answer: does offloading verification to real OS
+// threads (WorkerPoolEvaluator, src/layer1/worker-pool.ts) actually fix the
+// CPU bottleneck the original 'best-of-n' run exposed - where topology/claim
+// wall-clock got WORSE than single-shot, because 4x the synchronous
+// ts-morph/execution work per round competed for one JS event loop instead
+// of truly parallelizing? Same sampleSize/temperatures/earlyExit as
+// 'best-of-n' - the ONLY variable changed is where the gate checks run.
+type Strategy = 'single-shot' | 'best-of-n' | 'best-of-n-workers'
 
 interface RunOutcome {
   ok: boolean
@@ -208,13 +217,16 @@ interface RunOutcome {
   firstRoundFailed: boolean
 }
 
-async function runTaskWithStrategy(task: Task, strategy: Strategy): Promise<RunOutcome> {
+async function runTaskWithStrategy(task: Task, strategy: Strategy, workerPool: WorkerPoolEvaluator | undefined): Promise<RunOutcome> {
   const client = new SyntheticStochasticLlmClient(SUCCESS_PROBABILITY, task.goodCandidate, task.badCandidate)
   const request: CeilingRequest = { kind: task.domain, description: task.description }
+  const bestOfNConfig = { sampleSize: 4, baseTemperature: 0.2, temperatureStrategy: 'stepped' as const, earlyExitOnSuccess: true }
   const options =
     strategy === 'best-of-n'
-      ? { maxRetries: MAX_RETRIES, bestOfN: { sampleSize: 4, baseTemperature: 0.2, temperatureStrategy: 'stepped' as const, earlyExitOnSuccess: true } }
-      : { maxRetries: MAX_RETRIES }
+      ? { maxRetries: MAX_RETRIES, bestOfN: bestOfNConfig }
+      : strategy === 'best-of-n-workers'
+        ? { maxRetries: MAX_RETRIES, bestOfN: { ...bestOfNConfig, workerPool } }
+        : { maxRetries: MAX_RETRIES }
 
   const start = performance.now()
   try {
@@ -310,34 +322,62 @@ function printDeltaSummary(metrics: DomainStrategyMetrics[]) {
         `healing convergence: ${a.healingConvergenceRate.toFixed(1)}% -> ${b.healingConvergenceRate.toFixed(1)}%`
     )
   }
+
+  console.log('\n=== Single-Threaded vs Worker-Pool Best-of-N: did offloading fix the CPU bottleneck? ===')
+  for (const domain of domains) {
+    const single = metrics.find((m) => m.domain === domain && m.strategy === 'single-shot')
+    const inProcess = metrics.find((m) => m.domain === domain && m.strategy === 'best-of-n')
+    const workers = metrics.find((m) => m.domain === domain && m.strategy === 'best-of-n-workers')
+    if (!single || !inProcess || !workers) continue
+    const wallClockDelta = workers.avgElapsedMs - inProcess.avgElapsedMs
+    const verdict = workers.avgElapsedMs <= single.avgElapsedMs ? 'FIXED (at or below single-shot)' : workers.avgElapsedMs < inProcess.avgElapsedMs ? 'IMPROVED (still above single-shot)' : 'NOT IMPROVED'
+    console.log(
+      `${domain.padEnd(12)} avg ms: single-shot ${single.avgElapsedMs.toFixed(1)} | best-of-n (in-process) ${inProcess.avgElapsedMs.toFixed(1)} | ` +
+        `best-of-n (workers) ${workers.avgElapsedMs.toFixed(1)} (${wallClockDelta >= 0 ? '+' : ''}${wallClockDelta.toFixed(1)}ms vs in-process)  -> ${verdict}`
+    )
+  }
 }
 
+const STRATEGIES = ['single-shot', 'best-of-n', 'best-of-n-workers'] as const
+
 async function main() {
+  const domainCount = Object.keys(DOMAIN_TASK_BUILDERS).length
   console.log('Best-of-N Parallel Sampling vs Single-Shot: synthetic benchmark')
   console.log(
-    `${TASKS_PER_DOMAIN} hard synthetic tasks per domain x ${Object.keys(DOMAIN_TASK_BUILDERS).length} domains = ` +
-      `${TASKS_PER_DOMAIN * Object.keys(DOMAIN_TASK_BUILDERS).length} tasks, each run under both strategies ` +
-      `(${TASKS_PER_DOMAIN * Object.keys(DOMAIN_TASK_BUILDERS).length * 2} total executions).`
+    `${TASKS_PER_DOMAIN} hard synthetic tasks per domain x ${domainCount} domains = ` +
+      `${TASKS_PER_DOMAIN * domainCount} tasks, each run under ${STRATEGIES.length} strategies ` +
+      `(${TASKS_PER_DOMAIN * domainCount * STRATEGIES.length} total executions).`
   )
-  console.log(`Per-attempt success probability: ${SUCCESS_PROBABILITY} (deliberately low - "hard" tasks). maxRetries: ${MAX_RETRIES} rounds for both strategies.`)
-  console.log('Best-of-N config: sampleSize 4, temperatures 0.2/0.4/0.6/0.8 (stepped), earlyExitOnSuccess: true.\n')
+  console.log(`Per-attempt success probability: ${SUCCESS_PROBABILITY} (deliberately low - "hard" tasks). maxRetries: ${MAX_RETRIES} rounds for every strategy.`)
+  console.log('Best-of-N config (both variants): sampleSize 4, temperatures 0.2/0.4/0.6/0.8 (stepped), earlyExitOnSuccess: true.')
 
-  const allMetrics: DomainStrategyMetrics[] = []
+  // One pool for the whole run, reused across every task/domain - spawning
+  // a fresh pool per task would defeat the purpose (worker spawn + Z3 WASM
+  // init is real, amortized overhead, not free per call). Shut down exactly
+  // once at the end, success or failure, so the process can exit cleanly.
+  const workerPool = new WorkerPoolEvaluator()
+  console.log(`Worker pool size: ${workerPool.poolSize} (os.cpus().length - 1).\n`)
 
-  for (const [domain, buildTasks] of Object.entries(DOMAIN_TASK_BUILDERS)) {
-    const tasks = buildTasks()
-    for (const strategy of ['single-shot', 'best-of-n'] as const) {
-      const outcomes: RunOutcome[] = []
-      for (const task of tasks) {
-        outcomes.push(await runTaskWithStrategy(task, strategy))
+  try {
+    const allMetrics: DomainStrategyMetrics[] = []
+
+    for (const [domain, buildTasks] of Object.entries(DOMAIN_TASK_BUILDERS)) {
+      const tasks = buildTasks()
+      for (const strategy of STRATEGIES) {
+        const outcomes: RunOutcome[] = []
+        for (const task of tasks) {
+          outcomes.push(await runTaskWithStrategy(task, strategy, strategy === 'best-of-n-workers' ? workerPool : undefined))
+        }
+        allMetrics.push(summarize(domain, strategy, outcomes))
       }
-      allMetrics.push(summarize(domain, strategy, outcomes))
+      console.log(`  ${domain}: done`)
     }
-    console.log(`  ${domain}: done`)
-  }
 
-  printTable(allMetrics)
-  printDeltaSummary(allMetrics)
+    printTable(allMetrics)
+    printDeltaSummary(allMetrics)
+  } finally {
+    await workerPool.shutdown()
+  }
 }
 
 main().catch((error: unknown) => {

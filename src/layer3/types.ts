@@ -1,4 +1,5 @@
 import type { FloorReport } from '../verification-floor'
+import type { WorkerPoolEvaluator, WorkerVerifyTask } from '../layer1/worker-pool'
 
 // Layer 3 (ROADMAP.md §2/§5): Best-of-N parallel candidate sampling. These
 // types drive src/verification-floor.ts's REAL generic VerificationFloor
@@ -37,4 +38,17 @@ export interface BestOfNResult<TCandidate, GateName extends string = string> {
   selected?: CandidateEvaluation<TCandidate, GateName>
   evaluations: CandidateEvaluation<TCandidate, GateName>[]
   totalElapsedMs: number
+}
+
+// Optional Phase 9 CPU-parallel offload: when supplied, evaluateBestOfN
+// tries to run each candidate's floor check on a WorkerPoolEvaluator
+// (src/layer1/worker-pool.ts) instead of in-process. `toTask` maps a
+// candidate to the worker's {domain, candidateText} request shape - return
+// null for a candidate/floor combination the worker pool doesn't support
+// (e.g. a domain the pool has no registry entry for), and the sampler
+// transparently falls back to the existing in-process runVerificationFloor
+// path, exactly as if no workerOffload had been configured at all.
+export interface WorkerOffload<TCandidate> {
+  pool: WorkerPoolEvaluator
+  toTask: (candidate: TCandidate) => WorkerVerifyTask | null
 }

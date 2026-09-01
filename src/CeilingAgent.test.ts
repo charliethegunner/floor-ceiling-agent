@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, afterEach } from 'vitest'
 import {
   runCeilingAgent,
   CeilingAgentExhaustedError,
@@ -15,6 +15,7 @@ import {
 import type { TopologyCandidate } from './topology-floor'
 import type { ClaimCandidate } from './claim-floor'
 import type { SpatialCandidate } from './spatial-floor'
+import { WorkerPoolEvaluator } from './layer1/worker-pool'
 
 class ScriptedLlmClient implements LlmClient {
   private index = 0
@@ -923,4 +924,135 @@ describe('runCeilingAgent: spatial domain routing, including Best-of-N (Phase 7)
     expect(result.gates.map((g) => g.gate)).toEqual(['continuity', 'volumetric-bound', 'self-intersection'])
     expect(JSON.parse(result.result)).toEqual(GOOD_SPATIAL_CANDIDATE)
   })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 9: bestOfN.workerPool - Best-of-N candidates verified across real OS
+// threads via WorkerPoolEvaluator (src/layer1/worker-pool.ts), instead of
+// in-process. Off by default (bestOfN.workerPool undefined), so every
+// existing Best-of-N test above is unaffected. Real worker_threads are
+// spawned here too, so every pool created must be shut down.
+// ---------------------------------------------------------------------------
+
+const workerPools: WorkerPoolEvaluator[] = []
+function trackedWorkerPool(...args: ConstructorParameters<typeof WorkerPoolEvaluator>): WorkerPoolEvaluator {
+  const pool = new WorkerPoolEvaluator(...args)
+  workerPools.push(pool)
+  return pool
+}
+
+afterEach(async () => {
+  await Promise.all(workerPools.splice(0).map((pool) => pool.shutdown()))
+})
+
+describe('runCeilingAgent: bestOfN.workerPool routes verification through real worker threads (Phase 9)', () => {
+  test('a passing topology candidate is verified correctly via the worker pool, with the full real gate array preserved', async () => {
+    const pool = trackedWorkerPool({ poolSize: 1 })
+    const llm = new TemperatureRoutedLlmClient((t) => (t === 0.8 ? JSON.stringify(GOOD_TOPOLOGY_CANDIDATE) : JSON.stringify(TOPOLOGY_CANDIDATE_WITH_MISSING_EXPORT)))
+
+    const result = await runCeilingAgent({ kind: 'topology', description: 'a module a.ts that calls b.ts#b' }, llm, { bestOfN: { workerPool: pool } })
+
+    expect(result.ok).toBe(true)
+    expect(result.gates.map((g) => g.gate)).toEqual(['exports', 'types', 'reachability'])
+    expect(result.gates.every((g) => g.ok)).toBe(true)
+  }, 15000)
+
+  test('a real Z3 instruction-domain proof still verifies correctly when a workerPool is supplied (routed in-process, not to the worker - see selective routing tests below)', async () => {
+    const pool = trackedWorkerPool({ poolSize: 1 })
+    const llm = new TemperatureRoutedLlmClient((t) => (t === 0.8 ? 'MOV X0, X1' : 'MOV X1, X0'))
+
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { bestOfN: { workerPool: pool } })
+
+    expect(result.ok).toBe(true)
+    expect(result.gates.map((g) => g.gate)).toEqual(['static', 'fuzz', 'symbolic'])
+    expect(result.gates.find((g) => g.gate === 'symbolic')?.details).toContain('Z3 proved')
+  }, 15000)
+
+  test('when the worker pool has been shut down, the round still succeeds via transparent in-process fallback', async () => {
+    const pool = new WorkerPoolEvaluator({ poolSize: 1 })
+    await pool.shutdown() // deliberately not tracked - already dead before use
+    const llm = new ScriptedLlmClient([JSON.stringify(GOOD_TOPOLOGY_CANDIDATE)])
+
+    const result = await runCeilingAgent({ kind: 'topology', description: 'a module a.ts that calls b.ts#b' }, llm, { bestOfN: { workerPool: pool } })
+
+    expect(result.ok).toBe(true)
+    expect(result.gates.every((g) => g.ok)).toBe(true)
+  }, 15000)
+
+  test('a failing candidate still exhausts correctly with real gate feedback in history when using the worker pool', async () => {
+    const pool = trackedWorkerPool({ poolSize: 1 })
+    const llm = new TemperatureRoutedLlmClient(() => JSON.stringify(TOPOLOGY_CANDIDATE_WITH_MISSING_EXPORT))
+
+    try {
+      await runCeilingAgent({ kind: 'topology', description: 'a module a.ts that calls b.ts#b' }, llm, { maxRetries: 1, bestOfN: { workerPool: pool } })
+      expect.unreachable('expected runCeilingAgent to throw')
+    } catch (error) {
+      expect(error).toBeInstanceOf(CeilingAgentExhaustedError)
+      const exhausted = error as CeilingAgentExhaustedError
+      expect(exhausted.report.history).toHaveLength(1)
+      expect(exhausted.report.history[0].failedGate.gate).toBe('exports')
+    }
+  }, 15000)
+})
+
+// ---------------------------------------------------------------------------
+// Phase 9.1: selective per-domain worker routing. The live benchmark
+// (scripts/benchmark-sampler.ts) showed offloading is NOT a universal win:
+// z3-solver's WASM module initializes fresh per worker thread (never
+// shared - see WorkerPoolEvaluator's own doc comment), and that per-worker
+// init cost dwarfs an already-fast in-process Z3 check (measured: 30.7ms ->
+// 196ms for 'instruction'). 'spatial's pure-JS SDF math was already so
+// cheap (~1.8ms) that message-passing overhead isn't worth paying either.
+// 'topology'/'claim's real ts-morph Project creation, by contrast, is
+// genuinely CPU-heavy enough that real OS-thread parallelism pays for
+// itself (measured: 782ms -> 425ms, 3482ms -> 1470ms). So only topology and
+// claim route through workerPool by default; instruction and spatial always
+// verify in-process, even when a workerPool is supplied - proven below by
+// spying on the pool's own verify() method, not just checking the result is
+// correct (which would be true either way).
+// ---------------------------------------------------------------------------
+
+function spyOnVerify(pool: WorkerPoolEvaluator): { callCount: () => number } {
+  const original = pool.verify.bind(pool)
+  let calls = 0
+  pool.verify = (...args: Parameters<typeof original>) => {
+    calls++
+    return original(...args)
+  }
+  return { callCount: () => calls }
+}
+
+describe('runCeilingAgent: selective per-domain worker routing (Phase 9.1)', () => {
+  test('instruction and spatial domains never contact the worker pool, even when one is supplied', async () => {
+    const pool = trackedWorkerPool({ poolSize: 1 })
+    const spy = spyOnVerify(pool)
+
+    const instructionLlm = new TemperatureRoutedLlmClient((t) => (t === 0.8 ? 'MOV X0, X1' : 'MOV X1, X0'))
+    const instructionResult = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, instructionLlm, { bestOfN: { workerPool: pool } })
+    expect(instructionResult.ok).toBe(true)
+
+    const spatialLlm = new TemperatureRoutedLlmClient((t) => (t === 0.8 ? JSON.stringify(GOOD_SPATIAL_CANDIDATE) : JSON.stringify(DEGENERATE_SPATIAL_CANDIDATE)))
+    const spatialResult = await runCeilingAgent(
+      { kind: 'spatial', description: 'a sphere of radius 1 centered at the origin within a [-2,2]^3 bounding box' },
+      spatialLlm,
+      { bestOfN: { workerPool: pool } }
+    )
+    expect(spatialResult.ok).toBe(true)
+
+    expect(spy.callCount()).toBe(0)
+  }, 15000)
+
+  test('topology and claim domains DO contact the worker pool when one is supplied', async () => {
+    const pool = trackedWorkerPool({ poolSize: 1 })
+    const spy = spyOnVerify(pool)
+
+    const topologyLlm = new TemperatureRoutedLlmClient((t) => (t === 0.8 ? JSON.stringify(GOOD_TOPOLOGY_CANDIDATE) : JSON.stringify(TOPOLOGY_CANDIDATE_WITH_MISSING_EXPORT)))
+    await runCeilingAgent({ kind: 'topology', description: 'a module a.ts that calls b.ts#b' }, topologyLlm, { bestOfN: { workerPool: pool } })
+    expect(spy.callCount()).toBeGreaterThan(0)
+
+    const claimCallsBeforeClaim = spy.callCount()
+    const claimLlm = new TemperatureRoutedLlmClient((t) => (t === 0.8 ? JSON.stringify(GOOD_CLAIM_CANDIDATE) : 'garbage'))
+    await runCeilingAgent({ kind: 'claim', description: 'MOV RAX, RBX lowers to MOV X0, X1' }, claimLlm, { bestOfN: { workerPool: pool } })
+    expect(spy.callCount()).toBeGreaterThan(claimCallsBeforeClaim)
+  }, 15000)
 })
