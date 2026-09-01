@@ -4,6 +4,8 @@ import { getZ3, checkPushEquivalence, checkPopEquivalence, checkMemoryEquivalenc
 import { type VerificationFloor, type GateOutcome, runVerificationFloor } from './verification-floor'
 import { TOPOLOGY_FLOOR, type TopologyCandidate } from './topology-floor'
 import { CLAIM_VERIFICATION_FLOOR, type ClaimCandidate } from './claim-floor'
+import { ParallelCandidateSampler } from './layer3/sampler'
+import type { TemperatureStrategy } from './layer3/types'
 
 // ---------------------------------------------------------------------------
 // LLM client. A local Ollama or vLLM server both expose an OpenAI-compatible
@@ -14,7 +16,7 @@ import { CLAIM_VERIFICATION_FLOOR, type ClaimCandidate } from './claim-floor'
 // ---------------------------------------------------------------------------
 
 export interface LlmClient {
-  complete(prompt: string): Promise<string>
+  complete(prompt: string, temperature?: number): Promise<string>
 }
 
 export interface OpenAiCompatibleClientOptions {
@@ -26,7 +28,7 @@ export interface OpenAiCompatibleClientOptions {
 export class OpenAiCompatibleLlmClient implements LlmClient {
   constructor(private readonly options: OpenAiCompatibleClientOptions) {}
 
-  async complete(prompt: string): Promise<string> {
+  async complete(prompt: string, temperature = 0): Promise<string> {
     const response = await fetch(`${this.options.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -36,7 +38,7 @@ export class OpenAiCompatibleLlmClient implements LlmClient {
       body: JSON.stringify({
         model: this.options.model,
         messages: [{ role: 'user', content: prompt }],
-        temperature: 0,
+        temperature,
       }),
     })
 
@@ -549,13 +551,107 @@ const VERIFIERS: Record<CeilingRequestKind, (request: CeilingRequest, candidate:
   claim: (_request, candidate) => verifyClaimCandidate(candidate),
 }
 
-export async function runCeilingAgent(request: CeilingRequest, llm: LlmClient, options: { maxRetries?: number } = {}): Promise<CeilingSuccess> {
+// ---------------------------------------------------------------------------
+// Phase 6: opt-in Best-of-N parallel sampling (ROADMAP.md §2 Layer 3),
+// driven through src/layer3/sampler.ts's ParallelCandidateSampler - which
+// itself drives the REAL generic VerificationFloor contract
+// (src/verification-floor.ts), not a bespoke one-off. Off by default
+// (options.bestOfN undefined -> the original sequential single-candidate
+// loop, byte-identical to before Phase 6), so every existing caller and
+// every ScriptedLlmClient-based test above - which assumes exactly one LLM
+// call per attempt - is completely unaffected.
+//
+// runBestOfNRound wraps VERIFIERS[request.kind] (the SAME per-domain
+// verifier the sequential path already uses) in a throwaway single-gate
+// VerificationFloor<string, string> just to satisfy evaluateBestOfN's
+// signature - the real, granular GateCheckResult[] for the round's chosen
+// candidate is cached by candidate text (gatesByCandidate) rather than
+// re-derived from that synthetic gate, so callers still see real gate names
+// ('static'/'fuzz'/'symbolic', 'exports'/'types'/'reachability', etc.), never
+// the synthetic 'combined' label. When no sampled candidate passes, the
+// closest-to-passing candidate's REAL failed gate is pushed into `history`
+// exactly like the sequential path would - the existing closed-loop
+// self-healing (buildPrompt reading `history` on the next round) is what
+// actually consumes that feedback; Phase 6 only changes how many diverse
+// candidates feed it per round, not the healing mechanism itself.
+// ---------------------------------------------------------------------------
+
+export interface BestOfNOptions {
+  sampleSize?: number
+  baseTemperature?: number
+  temperatureStrategy?: TemperatureStrategy
+}
+
+async function runSingleCandidateRound(
+  request: CeilingRequest,
+  llm: LlmClient,
+  history: CeilingAttempt[]
+): Promise<{ candidate: string; gates: GateCheckResult[] }> {
+  const candidate = await llm.complete(buildPrompt(request, history))
+  const gates = await VERIFIERS[request.kind](request, candidate)
+  return { candidate, gates }
+}
+
+async function runBestOfNRound(
+  request: CeilingRequest,
+  llm: LlmClient,
+  history: CeilingAttempt[],
+  bestOfN: BestOfNOptions
+): Promise<{ candidate: string; gates: GateCheckResult[] }> {
+  const gatesByCandidate = new Map<string, GateCheckResult[]>()
+
+  const floor: VerificationFloor<string, string> = {
+    domain: request.kind,
+    gates: [
+      {
+        name: 'combined',
+        check: async (candidateText) => {
+          let gates = gatesByCandidate.get(candidateText)
+          if (!gates) {
+            gates = await VERIFIERS[request.kind](request, candidateText)
+            gatesByCandidate.set(candidateText, gates)
+          }
+          const failed = gates.find((g) => !g.ok)
+          return failed
+            ? { gate: failed.gate, ok: false, details: failed.details }
+            : { gate: 'combined', ok: true, details: `all ${gates.length} gate(s) passed` }
+        },
+      },
+    ],
+  }
+
+  const sampler = new ParallelCandidateSampler<string>({
+    sampleSize: bestOfN.sampleSize ?? 4,
+    baseTemperature: bestOfN.baseTemperature ?? 0.2,
+    temperatureStrategy: bestOfN.temperatureStrategy ?? 'stepped',
+    earlyExitOnSuccess: true,
+  })
+
+  const prompt = buildPrompt(request, history)
+  const result = await sampler.evaluateBestOfN((temperature) => llm.complete(prompt, temperature), floor)
+
+  const winner = result.selected
+  if (!winner) {
+    throw new Error(`runBestOfNRound: sampler produced no candidates (sampleSize=${bestOfN.sampleSize ?? 4})`)
+  }
+
+  const candidate = winner.candidate.payload
+  const gates = gatesByCandidate.get(candidate) ?? []
+  return { candidate, gates }
+}
+
+export async function runCeilingAgent(
+  request: CeilingRequest,
+  llm: LlmClient,
+  options: { maxRetries?: number; bestOfN?: BestOfNOptions } = {}
+): Promise<CeilingSuccess> {
   const maxRetries = options.maxRetries ?? MAX_RETRIES_DEFAULT
   const history: CeilingAttempt[] = []
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const candidate = await llm.complete(buildPrompt(request, history))
-    const gates = await VERIFIERS[request.kind](request, candidate)
+    const { candidate, gates } = options.bestOfN
+      ? await runBestOfNRound(request, llm, history, options.bestOfN)
+      : await runSingleCandidateRound(request, llm, history)
 
     const failedGate = gates.find((g) => !g.ok)
     if (!failedGate) {

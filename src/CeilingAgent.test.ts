@@ -25,6 +25,21 @@ class ScriptedLlmClient implements LlmClient {
   }
 }
 
+// For Best-of-N tests: real Best-of-N sampling fires several parallel
+// completions at different temperatures per round, so a client keyed by
+// call ORDER (like ScriptedLlmClient) can't express "this specific
+// temperature returns the correct candidate." Rounds to 1 decimal place to
+// sidestep floating-point drift in stepped temperature computation
+// (e.g. 0.2 + 3*0.2 !== 0.8 exactly in IEEE 754).
+class TemperatureRoutedLlmClient implements LlmClient {
+  callCount = 0
+  constructor(private readonly byTemperature: (roundedTemperature: number) => string) {}
+  async complete(_prompt: string, temperature = 0): Promise<string> {
+    this.callCount++
+    return this.byTemperature(Number(temperature.toFixed(1)))
+  }
+}
+
 describe('runCeilingAgent: instruction mode', () => {
   test('accepts a correct candidate on the first attempt', async () => {
     const llm = new ScriptedLlmClient(['MOV X0, X1'])
@@ -265,6 +280,44 @@ describe('OpenAiCompatibleLlmClient', () => {
     try {
       const client = new OpenAiCompatibleLlmClient({ baseUrl: 'http://localhost:11434/v1', model: 'missing-model' })
       await expect(client.complete('anything')).rejects.toThrow(/404/)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  // Phase 6: complete() gained an optional temperature parameter so
+  // ParallelCandidateSampler's stepped-temperature Best-of-N sampling can
+  // actually produce diverse candidates from a real endpoint, not just
+  // decorative numbers nothing reads.
+  test('threads an explicit temperature through to the request body', async () => {
+    const calls: Array<{ body: unknown }> = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      calls.push({ body: JSON.parse(init?.body as string) })
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'X' } }] }), { status: 200 })
+    }) as typeof fetch
+
+    try {
+      const client = new OpenAiCompatibleLlmClient({ baseUrl: 'http://localhost:11434/v1', model: 'qwen2.5-coder' })
+      await client.complete('prompt', 0.7)
+      expect(calls[0].body).toMatchObject({ temperature: 0.7 })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('defaults temperature to 0 when omitted, preserving prior deterministic behavior', async () => {
+    const calls: Array<{ body: unknown }> = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      calls.push({ body: JSON.parse(init?.body as string) })
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'X' } }] }), { status: 200 })
+    }) as typeof fetch
+
+    try {
+      const client = new OpenAiCompatibleLlmClient({ baseUrl: 'http://localhost:11434/v1', model: 'qwen2.5-coder' })
+      await client.complete('prompt')
+      expect(calls[0].body).toMatchObject({ temperature: 0 })
     } finally {
       globalThis.fetch = originalFetch
     }
@@ -690,5 +743,97 @@ describe('buildPrompt: routes domain-specific instructions for topology and clai
     expect(prompt).toContain('MOV RAX, RBX lowers to MOV X0, X1')
     expect(prompt).toContain('JSON')
     expect(prompt).not.toContain('ARM64 instruction text')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 6: opt-in Best-of-N parallel sampling, via src/layer3/sampler.ts's
+// ParallelCandidateSampler, genuinely driving the real per-kind verifiers
+// (not a fictional standalone floor). Opt-in via options.bestOfN so every
+// EXISTING sequential-retry test above (which assumes exactly one LLM call
+// per attempt via ScriptedLlmClient's ordered response queue) is completely
+// unaffected - Best-of-N only activates when a caller explicitly asks.
+// ---------------------------------------------------------------------------
+
+describe('runCeilingAgent: opt-in Best-of-N parallel sampling (Phase 6)', () => {
+  test('with no bestOfN option, behavior is byte-identical to the sequential path (regression guard)', async () => {
+    const llm = new ScriptedLlmClient(['MOV X0, X1'])
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm)
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(1)
+  })
+
+  test('samples several candidates at stepped temperatures in parallel and succeeds via whichever one passes', async () => {
+    // Default bestOfN config: sampleSize 4, temperatures 0.2/0.4/0.6/0.8.
+    // Only the 0.8 candidate is symbolically correct.
+    const llm = new TemperatureRoutedLlmClient((t) => (t === 0.8 ? 'MOV X0, X1' : 'MOV X1, X0'))
+
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { bestOfN: {} })
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(1)
+    expect(result.result).toBe('MOV X0, X1')
+    expect(llm.callCount).toBe(4)
+  })
+
+  test('a custom sampleSize/baseTemperature/temperatureStrategy is honored', async () => {
+    const llm = new TemperatureRoutedLlmClient(() => 'MOV X0, X1')
+
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, {
+      bestOfN: { sampleSize: 2, baseTemperature: 0.5, temperatureStrategy: 'fixed' },
+    })
+
+    expect(result.ok).toBe(true)
+    expect(llm.callCount).toBe(2)
+  })
+
+  test('when no sampled candidate passes, the round exhausts after maxRetries with real per-round failure feedback in history', async () => {
+    const llm = new TemperatureRoutedLlmClient(() => 'garbage')
+
+    await expect(
+      runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { maxRetries: 1, bestOfN: {} })
+    ).rejects.toThrow(CeilingAgentExhaustedError)
+  })
+
+  test('the exhausted report carries one history entry per round, with a real gate name/details from the round', async () => {
+    const llm = new TemperatureRoutedLlmClient(() => 'garbage')
+
+    try {
+      await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { maxRetries: 1, bestOfN: {} })
+      expect.unreachable('expected runCeilingAgent to throw')
+    } catch (error) {
+      expect(error).toBeInstanceOf(CeilingAgentExhaustedError)
+      const exhausted = error as CeilingAgentExhaustedError
+      expect(exhausted.report.history).toHaveLength(1)
+      expect(exhausted.report.history[0].failedGate.ok).toBe(false)
+      expect(exhausted.report.history[0].failedGate.gate).not.toBe('combined')
+    }
+  })
+
+  test('self-corrects across bestOfN rounds: round 1 fails, round 2 finds a passing candidate', async () => {
+    let round = 0
+    // Every temperature within a round returns the same thing per round, so
+    // the test only depends on ROUND number, not on which of the 4 parallel
+    // calls happens to be observed first.
+    const llm = new TemperatureRoutedLlmClient(() => {
+      round++
+      return round <= 4 ? 'MOV X1, X0' : 'MOV X0, X1'
+    })
+
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { bestOfN: {} })
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(2)
+    expect(result.history).toHaveLength(1)
+  })
+
+  test('Best-of-N also drives the topology and claim domains through the real TOPOLOGY_FLOOR/CLAIM_VERIFICATION_FLOOR', async () => {
+    const llm = new TemperatureRoutedLlmClient((t) => (t === 0.8 ? JSON.stringify(GOOD_CLAIM_CANDIDATE) : 'garbage'))
+
+    const result = await runCeilingAgent({ kind: 'claim', description: 'MOV RAX, RBX lowers to MOV X0, X1' }, llm, { bestOfN: {} })
+
+    expect(result.ok).toBe(true)
+    expect(result.gates.map((g) => g.gate)).toEqual(['structural', 'cross-reference', 'empirical'])
   })
 })
