@@ -217,23 +217,57 @@ describe('ActionExecutor.exportCADModels', () => {
   })
 })
 
-describe('ActionExecutor.executeBinaryPayload: fail-closed', () => {
-  test('always returns executed: false with the required safety reason, for every execution mode', () => {
-    for (const executionMode of ['dry-run', 'interactive', 'auto', 'auto-commit'] as const) {
-      const executor = new ActionExecutor({ executionMode, targetWorkspace: workspace })
-      const result = executor.executeBinaryPayload(new Uint8Array([0x00, 0x00, 0x80, 0xd2]))
+describe('ActionExecutor.executeBinaryPayload: Phase 12.1 real isolated sandbox execution', () => {
+  test('auto mode genuinely executes a verified instruction and returns the real resulting register state', async () => {
+    const executor = new ActionExecutor({ executionMode: 'auto', targetWorkspace: workspace })
+    const result = await executor.executeBinaryPayload(passResponse(), 'ADD X0, X1, X2', { X1: 3n, X2: 4n })
 
-      expect(result).toEqual({ executed: false, reason: 'Binary execution disabled — requires microVM/seccomp isolation' })
-    }
+    expect(result.executed).toBe(true)
+    expect(result.executed && result.registers.X0).toBe(7n)
+  }, 15000)
+
+  test('dry-run reports the instruction count without spawning a sandbox worker', async () => {
+    const executor = new ActionExecutor({ executionMode: 'dry-run', targetWorkspace: workspace })
+    const result = await executor.executeBinaryPayload(passResponse(), 'ADD X0, X1, X2', { X1: 3n, X2: 4n })
+
+    expect(result).toEqual({ executed: false, reason: 'dry-run: would execute 1 instruction(s) in the isolated sandbox' })
   })
 
-  test('never spawns a host subprocess (no child_process call happens for this method)', () => {
+  test('interactive mode executes only after the injected confirm callback approves', async () => {
+    const declining = new ActionExecutor({ executionMode: 'interactive', targetWorkspace: workspace, confirm: async () => false })
+    const declined = await declining.executeBinaryPayload(passResponse(), 'ADD X0, X1, X2', { X1: 3n, X2: 4n })
+    expect(declined).toEqual({ executed: false, reason: 'user declined the interactive prompt for executeBinaryPayload' })
+
+    const approving = new ActionExecutor({ executionMode: 'interactive', targetWorkspace: workspace, confirm: async () => true })
+    const approved = await approving.executeBinaryPayload(passResponse(), 'ADD X0, X1, X2', { X1: 3n, X2: 4n })
+    expect(approved.executed).toBe(true)
+  }, 15000)
+
+  test('refuses to execute from a FAIL outcome, for every execution mode', async () => {
+    for (const executionMode of ['dry-run', 'interactive', 'auto', 'auto-commit'] as const) {
+      const executor = new ActionExecutor({ executionMode, targetWorkspace: workspace, confirm: async () => true })
+      const result = await executor.executeBinaryPayload(failResponse(), 'ADD X0, X1, X2', { X1: 3n, X2: 4n })
+      expect(result.executed).toBe(false)
+      expect(result.executed === false && result.reason).toContain('not PASS')
+    }
+  }, 15000)
+
+  test('payload isolation: an instruction outside the closed register-transfer ALU subset is refused before any sandbox worker is spawned', async () => {
+    const executor = new ActionExecutor({ executionMode: 'auto', targetWorkspace: workspace })
+    const result = await executor.executeBinaryPayload(passResponse(), 'LDR X0, [X1]')
+
+    expect(result.executed).toBe(false)
+    expect(result.executed === false && result.reason).toContain('unsupported/unsafe instruction "LDR"')
+  })
+
+  test('never spawns a host subprocess (no child_process call happens for this method)', async () => {
     // execFileSync/spawn are only ever invoked from gitCommit - calling
     // executeBinaryPayload on a workspace with no git repo at all proves no
-    // subprocess was attempted, since a real spawn attempt there would throw.
+    // git subprocess was attempted, since a real spawn attempt there would throw.
     const executor = new ActionExecutor({ executionMode: 'auto-commit', targetWorkspace: workspace })
-    expect(() => executor.executeBinaryPayload(new Uint8Array([0x1f, 0x20, 0x03, 0xd5]))).not.toThrow()
-  })
+    const result = await executor.executeBinaryPayload(passResponse(), 'ADD X0, X1, X2', { X1: 3n, X2: 4n })
+    expect(result.executed).toBe(true)
+  }, 15000)
 })
 
 describe('meshSurfaceNets / toAsciiStl: geometric correctness (not fabricated data)', () => {

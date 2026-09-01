@@ -5,6 +5,8 @@ import { randomUUID } from 'node:crypto'
 import { createInterface } from 'node:readline/promises'
 import type { FormattedEngineResponse, DiffLine, VerificationTraceEntry } from '../telemetry/output-formatter'
 import { evaluateSdf, type SdfNode, type BoundingBox } from '../spatial-floor'
+import { SandboxRunner, type SandboxExecutionOptions, type SandboxExecutionResult } from './sandbox-runner'
+import { validateExecutableProgram } from './sandbox-instruction-set'
 
 // Phase 11.7: Autonomous Action Floor - the only module in this project
 // permitted to mutate the filesystem or spawn subprocesses on behalf of a
@@ -22,16 +24,16 @@ import { evaluateSdf, type SdfNode, type BoundingBox } from '../spatial-floor'
 //   - 'auto': write immediately, no confirmation.
 //   - 'auto-commit': write, then git add+commit (optionally on a fresh branch).
 //
-// executeBinaryPayload is deliberately a fail-closed stub, per invariant 4:
-// running arbitrary LLM-generated machine code is the "candidate CODE, not
-// candidate DATA" case this project has refused since Phase 5 (see
-// CeilingAgent.ts's verifyPatchCandidate) - a passing Z3/fuzz gate proves
-// semantic equivalence to the source instruction, not that the bytes are
-// SAFE to execute, and this project has no real sandbox (no seccomp/VM/
-// container) to contain a subprocess running them. It always returns
-// `{ executed: false, ... }`, honestly reported as such, until real
-// microVM/seccomp isolation is scoped as its own task - not silently
-// implemented, and not faked.
+// executeBinaryPayload (Phase 12.1) delegates to SandboxRunner
+// (sandbox-runner.ts) - a real isolated execution context for the CLOSED,
+// provably-safe ARM64 register-transfer ALU subset instruction-floor.ts's
+// Z3 gate already models, NOT a general machine-code executor. It is
+// gated on the SAME verification outcome + execution-mode rules as
+// applyCodePatches/exportCADModels above. See sandbox-runner.ts's header
+// comment for why this isn't WASM/WASI or seccomp (neither applies here)
+// and for what genuinely IS enforced (a real per-isolate memory ceiling,
+// real preemptive termination on timeout, zero IO surface by
+// construction).
 
 export type ExecutionMode = 'dry-run' | 'interactive' | 'auto' | 'auto-commit'
 
@@ -57,10 +59,10 @@ export type ActionResult =
   | { ok: true; action: string; dryRun: boolean; details: string; writtenPath?: string; proposedDiff?: DiffLine[]; verificationTraces?: VerificationTraceEntry[] }
   | { ok: false; action: string; reason: string }
 
-export interface BinaryExecutionResult {
-  executed: false
-  reason: string
-}
+/** Phase 12.1: an alias, not a redefinition - executeBinaryPayload's result
+ *  IS a SandboxExecutionResult. Kept as a distinct exported name for
+ *  import-site continuity with Phase 11.7's original stub type. */
+export type BinaryExecutionResult = SandboxExecutionResult
 
 // ---------------------------------------------------------------------------
 // exportCADModels' mesher: naive surface nets over evaluateSdf (spatial-
@@ -247,6 +249,8 @@ async function defaultConfirm(message: string): Promise<boolean> {
 }
 
 export class ActionExecutor {
+  private readonly sandbox = new SandboxRunner()
+
   constructor(private readonly options: ActionExecutionOptions) {}
 
   private resolveWorkspacePath(relativePath: string): string {
@@ -365,7 +369,37 @@ export class ActionExecutor {
     return { ok: true, action: 'exportCADModels', dryRun: false, details: `wrote ${triangles.length} triangle(s) to ${target}`, writtenPath: target }
   }
 
-  executeBinaryPayload(_assemblyBytes: Uint8Array): BinaryExecutionResult {
-    return { executed: false, reason: 'Binary execution disabled — requires microVM/seccomp isolation' }
+  async executeBinaryPayload(
+    response: FormattedEngineResponse,
+    arm64Assembly: string,
+    initialRegisters: Record<string, bigint> = {},
+    sandboxOptions?: SandboxExecutionOptions
+  ): Promise<SandboxExecutionResult> {
+    if (response.summary.outcome !== 'PASS') {
+      return { executed: false, reason: `refusing to execute: verification outcome was "${response.summary.outcome}", not PASS` }
+    }
+
+    const lines = arm64Assembly.split('\n')
+    const instructionCount = lines.filter((line) => line.trim().length > 0).length
+
+    // Admission control here too (SandboxRunner re-validates internally as
+    // its own independent boundary) - lets dry-run/interactive report an
+    // HONEST outcome without ever spawning a sandbox worker for a payload
+    // that was always going to be refused.
+    const rejection = validateExecutableProgram(lines)
+    if (rejection) {
+      return { executed: false, reason: `${rejection.reason} (in "${rejection.line}")` }
+    }
+
+    if (this.options.executionMode === 'dry-run') {
+      return { executed: false, reason: `dry-run: would execute ${instructionCount} instruction(s) in the isolated sandbox` }
+    }
+
+    if (this.options.executionMode === 'interactive') {
+      const approved = await (this.options.confirm ?? defaultConfirm)(`Execute ${instructionCount} verified instruction(s) in the isolated sandbox?`)
+      if (!approved) return { executed: false, reason: 'user declined the interactive prompt for executeBinaryPayload' }
+    }
+
+    return this.sandbox.execute(arm64Assembly, initialRegisters, sandboxOptions)
   }
 }
