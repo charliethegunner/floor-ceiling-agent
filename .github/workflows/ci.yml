@@ -5,6 +5,14 @@ name: CI
     branches: [main]
   pull_request:
 
+# Node 24, not 20 (Phase 25.0): worker_threads spawned with `execArgv:
+# ['--import', 'tsx']` (src/layer1/worker-pool.ts,
+# src/layer1/brep/brep-worker-pool.ts) genuinely cannot run on Node 20.20.2 -
+# every worker throws ERR_UNKNOWN_FILE_EXTENSION for its own .ts entry
+# point - isolated with a controlled test (same OS/tsx version, only the
+# Node version changed) before this pin was raised. Node 20 is also past
+# its LTS end-of-life. See package.json's "engines" field and
+# docs/DEPLOYMENT.md §1.4/appendix.
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -13,11 +21,168 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'npm'
 
       - run: npm ci
 
-      - run: npx tsc --noEmit
+      - name: Type check
+        run: npx tsc --noEmit
 
-      - run: npm test
+      # --poolOptions.forks.{min,max}Forks bounds how many test FILES vitest
+      # runs concurrently (each of which can itself spin up real Z3/
+      # ts-morph/OpenCASCADE worker_threads pools - see
+      # docs/DEPLOYMENT.md §1). This project's vitest 2.1.9 defaults to the
+      # 'forks' pool, not 'threads' (its own --help text is misleading on
+      # this); the bare --maxWorkers flag throws "options.minThreads and
+      # options.maxThreads must not conflict" in this version - empirically
+      # verified before use, not assumed - so both bounds are set
+      # explicitly instead. Grounded in a real, observed failure mode, not a
+      # guess: running this suite's full parallelism against a
+      # resource-constrained host produced genuine, non-deterministic
+      # timeouts and assertion failures in the Z3/worker-pool tests
+      # (different specific test each run) that went away once free memory
+      # recovered - the exact "flaky CI failure waiting to happen on
+      # different hardware" ARCHITECTURE.md §9 already warns hard
+      # timing/RSS assertions invite. Constraining concurrency here
+      # addresses the CAUSE (resource contention), not the symptom.
+      #
+      # Deliberately NOT setting NODE_OPTIONS=--max-old-space-size here,
+      # despite that being the more obvious "give CI more headroom" lever:
+      # empirically verified it leaks into src/layer1/sandbox-runner.ts's
+      # worker_threads and silently overrides their explicit
+      # `resourceLimits.maxOldGenerationSizeMb` ceiling (a real Node/V8
+      # interaction, reproduced with and without the flag on the same test)
+      # - src/layer1/sandbox-runner.test.ts's "an execution that blows the
+      # configured V8 heap ceiling is terminated" test passed vacuously
+      # under a global NODE_OPTIONS override, since the sandboxed worker
+      # could then allocate far past its declared 8MB ceiling. That test is
+      # this project's actual security boundary for executing untrusted
+      # LLM-generated code (ARCHITECTURE.md §7.8) - shipping a CI config
+      # that quietly defeats it is a worse outcome than the memory
+      # constraint it was meant to relax. --poolOptions.forks.maxForks
+      # alone is what the real, observed flakiness needed.
+      - name: Run test suite
+        run: npm test -- --poolOptions.forks.minForks=1 --poolOptions.forks.maxForks=2
+
+  server-smoke-test:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - run: npm ci
+
+      # One shell script, one step: a background server process started in
+      # an earlier step isn't a child of a later step's shell, so `wait`/
+      # exit-code checks on it wouldn't work split across steps. Mirrors
+      # src/server/index.test.ts's own graceful-shutdown test pattern (real
+      # process, not mocked) and was validated locally the same way before
+      # being committed here: start from a real production-dependency
+      # install, poll /healthz, assert both routes, send a real SIGTERM,
+      # and assert the real exit code src/layer1/process-lifecycle.ts's
+      # EXIT_CODE_BY_SIGNAL.SIGTERM produces (143).
+      - name: Start server, verify /healthz + /ready, trigger graceful shutdown
+        shell: bash
+        run: |
+          set -e
+          LLM_BASE_URL=http://localhost:11434/v1 LLM_MODEL=ci-smoke-test PORT=3000 \
+          WORKER_POOL_SIZE=1 BREP_WORKER_POOL_SIZE=1 \
+            npx tsx src/server/index.ts > server.log 2>&1 &
+          SERVER_PID=$!
+
+          READY=0
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/healthz 2>/dev/null | grep -q 200; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "server did not become healthy within 30s"
+            cat server.log
+            exit 1
+          fi
+
+          HEALTHZ_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/healthz)
+          READY_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/ready)
+          echo "GET /healthz -> $HEALTHZ_CODE, GET /ready -> $READY_CODE"
+          if [ "$HEALTHZ_CODE" -ge 500 ] || [ "$READY_CODE" -ge 500 ]; then
+            echo "server returned a 5xx status"
+            cat server.log
+            exit 1
+          fi
+          if [ "$HEALTHZ_CODE" -ne 200 ] || [ "$READY_CODE" -ne 200 ]; then
+            echo "expected 200 from both /healthz and /ready, got $HEALTHZ_CODE / $READY_CODE"
+            cat server.log
+            exit 1
+          fi
+
+          kill -TERM "$SERVER_PID"
+          wait "$SERVER_PID"
+          EXIT_CODE=$?
+          echo "server exited with code $EXIT_CODE after SIGTERM"
+          if [ "$EXIT_CODE" -ne 143 ]; then
+            echo "expected exit code 143 (src/layer1/process-lifecycle.ts's SIGTERM code), got $EXIT_CODE"
+            cat server.log
+            exit 1
+          fi
+
+      - name: Server log
+        if: always()
+        run: cat server.log || true
+
+  docker-build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build production image
+        run: docker build -t floor-ceiling-agent:ci .
+
+      # docker build succeeding proves the image assembles; it says nothing
+      # about the image actually booting (non-root user permissions, the
+      # runtime-only dependency set from --omit=dev, the HEALTHCHECK
+      # command itself). Run it for real and poll Docker's own health
+      # status rather than trusting the build alone.
+      - name: Run image and wait for a healthy HEALTHCHECK status
+        shell: bash
+        run: |
+          set -e
+          docker run -d --name fca-smoke -p 3000:3000 \
+            -e LLM_BASE_URL=http://localhost:11434/v1 \
+            -e LLM_MODEL=ci-smoke-test \
+            -e WORKER_POOL_SIZE=1 -e BREP_WORKER_POOL_SIZE=1 \
+            floor-ceiling-agent:ci
+
+          STATUS="starting"
+          for i in $(seq 1 30); do
+            STATUS=$(docker inspect --format='{{.State.Health.Status}}' fca-smoke 2>/dev/null || echo "starting")
+            echo "health status: $STATUS"
+            if [ "$STATUS" = "healthy" ]; then break; fi
+            if [ "$STATUS" = "unhealthy" ]; then
+              docker logs fca-smoke
+              exit 1
+            fi
+            sleep 3
+          done
+          if [ "$STATUS" != "healthy" ]; then
+            echo "container never reported healthy"
+            docker logs fca-smoke
+            exit 1
+          fi
+
+      - name: Container logs
+        if: always()
+        run: docker logs fca-smoke || true
+
+      - name: Tear down
+        if: always()
+        run: docker rm -f fca-smoke || true

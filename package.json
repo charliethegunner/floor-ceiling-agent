@@ -2,6 +2,9 @@
   "name": "my-project",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "test": "vitest run",
     "benchmark": "tsx scripts/benchmark-live.ts",
@@ -10,16 +13,18 @@
     "translate": "tsx bin/translate.ts",
     "server": "tsx src/server/index.ts"
   },
-  "devDependencies": {
-    "@grpc/grpc-js": "^1.14.4",
-    "@grpc/proto-loader": "^0.8.1",
-    "@types/node": "^26.4.0",
+  "dependencies": {
     "fast-check": "^4.9.0",
     "opencascade.js": "^1.1.1",
     "ts-morph": "^28.0.0",
     "tsx": "^4.23.13",
-    "typescript": "^5.5.4",
-    "vitest": "^2.0.5",
     "z3-solver": "^5.2.0"
+  },
+  "devDependencies": {
+    "@grpc/grpc-js": "^1.14.4",
+    "@grpc/proto-loader": "^0.8.1",
+    "@types/node": "^26.4.0",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5"
   }
 }

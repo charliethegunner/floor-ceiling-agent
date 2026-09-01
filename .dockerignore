@@ -1,0 +1,10 @@
+node_modules
+.git
+.github
+docs
+scripts
+bin
+*.test.ts
+**/*.test.ts
+coverage
+*.log

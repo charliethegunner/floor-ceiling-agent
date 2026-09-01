@@ -1,41 +1,50 @@
 # Deployment & Production Readiness Guide
 
-Phase 23.0, extended by Phase 24.0. This document defines operational SLAs,
-containerization patterns, process/WASM memory limits, and monitoring
-controls for running the "System 2" LLM-verified multi-domain engine
-(`CeilingAgent`, the five verification floors,
+Phase 23.0, extended by Phase 24.0 and Phase 25.0. This document defines
+operational SLAs, containerization patterns, process/WASM memory limits, and
+monitoring controls for running the "System 2" LLM-verified multi-domain
+engine (`CeilingAgent`, the five verification floors,
 `WorkerPoolEvaluator`/`BRepWorkerPoolEvaluator`, `EngineTracer`) described in
-`ARCHITECTURE.md` §7 onward, and the HTTP runtime wrapper that now exposes it
-(`src/server/`, Phase 24.0), in a production environment. Every value below is
-taken from the real defaults in `src/` on `main` — see the **Source-of-truth
-appendix** for exact file/line references. Nothing here is gated in CI; treat
-a stale number in this file as a bug, same as `ARCHITECTURE.md`.
+`ARCHITECTURE.md` §7 onward, the HTTP runtime wrapper that exposes it
+(`src/server/`, Phase 24.0), and the CI/CD pipeline and container image that
+build and validate it (`.github/workflows/ci.yml`, `Dockerfile`, Phase 25.0),
+in a production environment. Every value below is taken from the real
+defaults in `src/` on `main` — see the **Source-of-truth appendix** for exact
+file/line references. Nothing here is gated in CI beyond what
+`.github/workflows/ci.yml` itself runs; treat a stale number in this file as
+a bug, same as `ARCHITECTURE.md`.
 
 ## 0. What this system actually is (read before the rest of this doc)
 
 As of Phase 24.0, this project ships a real, lightweight HTTP entrypoint —
 `src/server/index.ts` (`createServer`), run via `npm run server` — that wraps
 `runCeilingAgent`, `WorkerPoolEvaluator`, and `BRepWorkerPoolEvaluator` behind
-`/healthz`, `/live`, `/ready`, `/verify`, and `/metrics` (§2.4, §3). It is
-still a plain `node:http` server with **no framework dependency**, and this
-repository still ships **no Dockerfile and no Kubernetes manifest** — §1.4's
-container guidance remains recommended operator wiring, not in-repo code.
-There is still no build step — every entrypoint (`bin/translate.ts`,
-`src/server/index.ts`, `scripts/*.ts`, the worker-thread scripts themselves)
-runs directly under `tsx` (`package.json`'s `scripts` block; CI runs `npx tsc
---noEmit` only for type-checking, never `tsc` to emit `.js`).
+`/healthz`, `/live`, `/ready`, `/verify`, and `/metrics` (§2.4, §3). It is a
+plain `node:http` server with **no framework dependency**.
+
+As of Phase 25.0, this repository ships a real, multi-stage `Dockerfile`
+(§1.4) and a three-job GitHub Actions pipeline (`.github/workflows/ci.yml`:
+`test` → `server-smoke-test` + `docker-build`, §1.4/§2.4) — both build the
+real image and boot the real server, not just lint them. There is still no
+`tsc`-emit build step and, deliberately, never will be one without changing
+this codebase's own worker-spawning architecture first: `src/layer1/
+worker-pool.ts` and `src/layer1/brep/brep-worker-pool.ts` spawn
+`worker_threads` with `execArgv: ['--import', 'tsx']` against a hardcoded
+`.ts` script path, so `tsx` is a genuine runtime dependency, not a dev
+convenience — see §1.4's Dockerfile writeup for what this meant for
+`package.json`.
 
 Sections 1-3 below therefore split into two kinds of guidance:
 
-- **Real, documented behavior** — the engine's and the HTTP wrapper's actual
-  configuration surface (constructor options, exported constants, parsed
-  environment variables), their actual memory/timeout defaults, and their
-  actual shutdown/telemetry/routing behavior. Cited to file/line.
-- **Recommended operator wiring** — how to containerize this deployment
-  (base image, resource limits, Kubernetes manifests), since none of that
-  exists in-repo today. Marked explicitly as recommendation, not existing
-  code, so this document can't be mistaken for a description of a deployment
-  pipeline that doesn't exist yet.
+- **Real, documented behavior** — the engine's, the HTTP wrapper's, and the
+  CI/Dockerfile's actual configuration surface (constructor options, exported
+  constants, parsed environment variables, workflow steps), their actual
+  memory/timeout defaults, and their actual shutdown/telemetry/routing
+  behavior. Cited to file/line.
+- **Recommended operator wiring** — Kubernetes manifests and orchestrator
+  config beyond what the Dockerfile/CI already build and smoke-test, since
+  none of that exists in-repo. Marked explicitly as recommendation, not
+  existing code.
 
 A team that needs behavior `src/server/` doesn't cover (a different protocol,
 auth, multi-tenancy) should still follow §2's real env-var names when
@@ -105,25 +114,57 @@ on Node builds that predate reliable cgroup-aware defaults):
   overhead — Z3/OpenCASCADE WASM linear memory is *outside* the V8 old-space
   heap and is not bounded by this flag at all).
 
-### 1.4 Container runtime boundaries (recommended — not in-repo)
+### 1.4 Container runtime boundaries (real, `Dockerfile`, Phase 25.0)
 
-There is no Dockerfile in this repository (the only `Dockerfile` under this
-checkout belongs to the `opencascade.js` dependency's own build tooling in
-`node_modules/`, unrelated to deploying this engine). Recommended pattern for
-a team building one:
+**Base image: `node:24-slim`, not `node:20-slim`.** This was originally
+`node:20-slim` in this section's Phase 23.0 draft, matching CI's original
+Node 20 pin — both were changed together after a real bug surfaced while
+actually building and booting the image for the first time (Phase 25.0's own
+validation step, not a hypothetical): `worker_threads` spawned with
+`execArgv: ['--import', 'tsx']` (§1.1/§1.2 — every `WorkerPoolEvaluator`/
+`BRepWorkerPoolEvaluator` worker) throw `ERR_UNKNOWN_FILE_EXTENSION` for
+their own `.ts` entry point on Node 20.20.2, and every real `/ready` self-
+check consequently falls back and reports `responsive: false`. Isolated with
+a controlled comparison — identical Linux container and `tsx` version, only
+the Node version changed — against a real `WorkerPoolEvaluator.verify()`
+call: fails on `node:20-slim`, succeeds on `node:24-slim`. Node 20 is also
+past its LTS end-of-life. `package.json`'s `"engines": { "node": ">=24" }`
+makes this a hard, visible constraint, not just a Dockerfile comment.
 
-- **Base image**: `node:20-slim` or later — CI (`.github/workflows/ci.yml`)
-  pins `node-version: '20'`; do not deploy on an untested major version.
-- **No build stage needed**: this repo ships no `.js` build output — `tsx`
-  must be present at runtime (`devDependencies`, so a production image needs
-  `npm ci` without `--omit=dev`, or `tsx` promoted to a runtime dependency).
+**Runtime dependency set, not `devDependencies`.** `tsx`, `ts-morph`,
+`z3-solver`, `opencascade.js`, and `fast-check` live in `package.json`'s
+`"dependencies"` (not `"devDependencies"`) as of Phase 25.0 — moved there
+specifically so the Dockerfile's `npm ci --omit=dev` installs a genuinely
+complete runtime set (20 packages, verified) rather than a broken one missing
+`tsx` (needed by every entrypoint, including every worker thread) and every
+real verification engine. `fast-check` is on this list because
+`src/instruction-floor.ts` imports from `src/FloorEngine.ts`, which imports
+`fast-check` at module scope for its own (unrelated, System 1) fuzz gate —
+ES module imports load the whole module graph eagerly, so that import alone
+makes `fast-check` resolvable-at-runtime a real requirement even though
+`instruction-floor.ts` itself never calls the fuzz gate. `@grpc/grpc-js`,
+`@grpc/proto-loader`, `typescript`, `@types/node`, and `vitest` stay dev-only
+— verified NOT reachable from `src/server/index.ts`'s real import graph (the
+gRPC packages back `src/layer1/distributed/`, which nothing under
+`src/server/` imports).
+
+**Multi-stage build, three stages**: `typecheck` (full `npm ci`, runs the
+real `npx tsc --noEmit` as a genuine build gate — a type error fails `docker
+build`, not just CI) → `production-deps` (`npm ci --omit=dev`, the minimal
+runtime `node_modules`) → `runtime` (copies both into a `node:24-slim` image,
+`chown`s to the image's existing non-root `node` user, `USER node`). There is
+still no `tsc`-emit stage producing different `.js` output — see §0 for why
+that specifically doesn't apply here.
+
 - **One container = one `WorkerPoolEvaluator`/`BRepWorkerPoolEvaluator`
   lifetime**: both pools register a single shared `SIGINT`/`SIGTERM` handler
   (`src/layer1/process-lifecycle.ts`) that tears down every live worker slot
   and exits `130`/`143` respectively (the conventional POSIX
-  signal-terminated codes) — this is real, existing behavior, and maps
-  directly onto Kubernetes' default `terminationGracePeriodSeconds` + SIGTERM
-  pattern with no extra wiring required. Ensure your pod's
+  signal-terminated codes); as of Phase 24.0 the HTTP server registers the
+  same way (§2.5). Verified for real, not assumed: `docker stop` (SIGTERM to
+  the image's PID 1, `CMD`'s exec-form array means `tsx` — not a shell — is
+  PID 1, so the signal reaches it directly) exited the container in ~1s with
+  `docker inspect`'s reported exit code `143`. Ensure your pod's
   `terminationGracePeriodSeconds` exceeds the longest in-flight
   `taskTimeoutMs` (30s default, §1.2) plus worker teardown time — 45-60s is a
   safe floor.
@@ -132,11 +173,24 @@ a team building one:
   specifically so the main thread keeps one core free (`worker-pool.ts:117`);
   under-provisioning CPU below that count defeats the reason that default
   exists.
-- **Expose one network port**: `src/server/index.ts` (Phase 24.0) binds
-  `PORT` (default `8080`, §2.2) via plain `node:http` — no gRPC port unless
-  you also construct a `DistributedWorkerPoolEvaluator`
-  (`src/layer1/distributed/`, opt-in, used only when a caller constructs it
-  explicitly).
+- **One network port**: the image sets `ENV PORT=3000` (overriding
+  `src/server/config.ts`'s own unset-default of `8080`, §2.2) and `EXPOSE
+  3000` to match — no gRPC port unless you also construct a
+  `DistributedWorkerPoolEvaluator` (`src/layer1/distributed/`, opt-in, not
+  wired into `src/server/`).
+- **`HEALTHCHECK`**: `CMD ["node", "-e", "fetch(...)..."]` against
+  `http://localhost:3000/healthz` every 30s (`--start-period=30s` before
+  failures count, `--retries=3`) — Node's own built-in `fetch` (Node 18+),
+  since `node:24-slim` has neither `curl` nor `wget` installed and this
+  avoids adding either just for the healthcheck. Checks `/healthz`
+  (liveness) specifically, not `/ready` — Docker's `HEALTHCHECK` and a
+  Kubernetes liveness probe should use the same semantics; point a
+  **readiness** probe at `/ready` separately (§2.4) if your orchestrator
+  supports both.
+- `LLM_BASE_URL`/`LLM_MODEL` are deployment-time configuration
+  (`src/server/config.ts` fails closed at startup if either is missing, §2.2)
+  — the image never bakes them in; supply via `docker run -e` / your
+  orchestrator's env injection, same as every other env var in §2.2.
 
 ## 2. Environment Configuration & Fail-Closed Safety
 
@@ -361,7 +415,7 @@ top of real, already-emitted telemetry:
 
 ## Source-of-truth appendix
 
-Verified directly against `main`, most recently at Phase 24.0. Re-verify this
+Verified directly against `main`, most recently at Phase 25.0. Re-verify this
 table, not just the prose above it, before trusting a number here after a
 future phase changes these files:
 
@@ -377,11 +431,18 @@ future phase changes these files:
 - `EngineTracer`, `getGateLatencies()` — `src/telemetry/tracer.ts`
 - `WorkerGateOutcome` — `src/layer1/worker-pool-worker.ts`
 - Generic gate/floor contract and `onGateComplete` timing hook — `src/verification-floor.ts`
-- CI Node version pin (`'20'`) — `.github/workflows/ci.yml:16`
+- CI Node version pin (`'24'`) — `.github/workflows/ci.yml:24,76`
+- `package.json`'s `"engines": { "node": ">=24" }` — `package.json`
 - No `process.env` reads relevant to these settings anywhere in `src/CeilingAgent.ts`, `src/layer1/*` (excluding `src/server/`), `lib/` — verified by repo-wide search
-- No `Dockerfile`/Kubernetes manifest in this repository — verified by repo-wide search
+- No Kubernetes manifest in this repository — verified by repo-wide search
 - **Phase 24.0 (HTTP runtime wrapper):**
   - `loadServerConfig`, `ServerConfig`, env var names/defaults — `src/server/config.ts`
   - `createServer`, `ServerDependencies`, route handlers, `RecycleWindowTracker`, `READY_RECYCLE_WINDOW_MS`/`READY_RECYCLE_THRESHOLD`, `MetricsState`, `main()`/graceful-shutdown wiring — `src/server/index.ts`
   - Route/config/shutdown test coverage — `src/server/index.test.ts`
   - `npm run server` script — `package.json`
+- **Phase 25.0 (CI/CD & container image):**
+  - Multi-stage production image (`typecheck`/`production-deps`/`runtime` stages, `node:24-slim` base, non-root `USER node`, `HEALTHCHECK` against `/healthz`) — `Dockerfile`
+  - Build-context exclusions (`node_modules`, `.git`, test files, etc.) — `.dockerignore`
+  - `test` (type check + `npm test` with bounded fork concurrency) → `server-smoke-test` + `docker-build` (both `needs: test`) — `.github/workflows/ci.yml`
+  - `tsx`/`ts-morph`/`z3-solver`/`opencascade.js`/`fast-check` moved to `"dependencies"` (from `"devDependencies"`), so `npm ci --omit=dev` installs a genuinely complete runtime set — `package.json`, `package-lock.json`
+  - Every claim above (image builds, boots, passes `/healthz`+`/ready` at 200, non-root `whoami`, real `docker stop` → exit code 143) was verified by actually running `docker build`/`docker run`/`docker stop` locally before being written here, not inferred from the Dockerfile's text
