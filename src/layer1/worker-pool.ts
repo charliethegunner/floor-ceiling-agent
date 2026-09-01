@@ -6,15 +6,38 @@ import type { WorkerDomain, WorkerVerifyTask, WorkerGateOutcome } from './worker
 
 export type { WorkerDomain, WorkerVerifyTask, WorkerGateOutcome }
 
+// Phase 12.0: re-exported so a WorkerPoolEvaluator caller can ingest a real
+// project pack (directory/ZIP/CAD/PDF) and turn it into the
+// WorkerVerifyTask.workspaceFiles a 'topology' task consumes (see
+// worker-pool-worker.ts's 'topology' case), without a separate import - the
+// verification path this enables is "a candidate checked against a real
+// multi-file repository graph," not just its own isolated proposed files.
+export { ProjectPackIngestor, toWorkspaceFiles, type ProjectWorkspaceGraph } from './ingestion-floor'
+
 const dirname = path.dirname(fileURLToPath(import.meta.url))
 const WORKER_SCRIPT_PATH = path.join(dirname, 'worker-pool-worker.ts')
 
 export interface WorkerPoolOptions {
   poolSize?: number
   taskTimeoutMs?: number
+  /** Phase 13.3: a worker reporting process.memoryUsage.rss() above this after a task is proactively terminated and respawned. Default 512MB - see DEFAULT_MAX_WORKER_RSS_BYTES's comment for why, and the class header comment below for the real-vs-per-worker caveat. */
+  maxWorkerRssBytes?: number
 }
 
 const DEFAULT_TASK_TIMEOUT_MS = 30_000
+
+// Empirically measured (standalone script, one worker, no vitest overhead),
+// not guessed: this pool's worker-pool-worker.ts eagerly imports EVERY
+// domain floor (Z3 via FloorEngine, ts-morph for topology/claim) regardless
+// of which task arrives first, so cold RSS already reaches ~258MB before
+// any real work happens; 10 mixed instruction/topology tasks on one worker
+// climbed to ~475MB (ts-morph Project creation per topology task is
+// genuinely heap-heavy and isn't immediately GC'd). A 256MB default (this
+// feature's originally-requested example threshold) would recycle nearly
+// every worker on its very first task, defeating the feature entirely -
+// 512MB gives real headroom above the measured healthy-operation range
+// while still catching genuinely unbounded growth well before a Node OOM.
+const DEFAULT_MAX_WORKER_RSS_BYTES = 512 * 1024 * 1024
 
 interface PendingTask {
   resolve: (gates: WorkerGateOutcome[]) => void
@@ -28,7 +51,7 @@ interface WorkerSlot {
   alive: boolean
 }
 
-type WorkerResponse = { taskId: number; ok: true; gates: WorkerGateOutcome[] } | { taskId: number; ok: false; error: string }
+type WorkerResponse = { taskId: number; ok: true; gates: WorkerGateOutcome[]; rssBytes: number } | { taskId: number; ok: false; error: string; rssBytes: number }
 
 let nextTaskId = 0
 
@@ -66,16 +89,38 @@ let nextTaskId = 0
 // supplies (typically the existing in-process runVerificationFloor call) -
 // a bad worker must never fail a candidate that would otherwise pass, only
 // make it slower.
+//
+// Phase 13.3 caveat (read before trusting maxWorkerRssBytes as a per-worker
+// isolation guarantee - it ISN'T one): worker_threads are real OS THREADS
+// sharing one process's address space, not separate OS processes like
+// child_process.fork. process.memoryUsage.rss() therefore reports the
+// WHOLE process's resident set - main thread plus every worker in this
+// pool - not any one worker's exclusive share. Recycling still does
+// something real: it discards the reporting worker's own V8 isolate
+// (whatever module-level state/heap growth THAT worker had accumulated -
+// e.g. large ts-morph Projects from big ingested packs), which reduces the
+// process's total footprint even though the RSS reading that triggered it
+// can't be attributed to one worker in isolation. This is disclosed rather
+// than presented as true per-thread memory isolation, which Node's
+// worker_threads model doesn't actually provide.
 export class WorkerPoolEvaluator {
   private readonly slots: WorkerSlot[]
   private readonly taskTimeoutMs: number
+  private readonly maxWorkerRssBytes: number
   private nextSlotIndex = 0
   private closed = false
+  private recycledWorkers = 0
 
   constructor(options: WorkerPoolOptions = {}) {
     const poolSize = Math.max(1, options.poolSize ?? os.cpus().length - 1)
     this.taskTimeoutMs = options.taskTimeoutMs ?? DEFAULT_TASK_TIMEOUT_MS
+    this.maxWorkerRssBytes = options.maxWorkerRssBytes ?? DEFAULT_MAX_WORKER_RSS_BYTES
     this.slots = Array.from({ length: poolSize }, () => this.spawnSlot())
+  }
+
+  /** Total workers proactively recycled for exceeding maxWorkerRssBytes, over this pool's lifetime. */
+  get recycledWorkerCount(): number {
+    return this.recycledWorkers
   }
 
   get poolSize(): number {
@@ -88,11 +133,16 @@ export class WorkerPoolEvaluator {
 
     worker.on('message', (message: WorkerResponse) => {
       const pending = slot.pending.get(message.taskId)
-      if (!pending) return
-      slot.pending.delete(message.taskId)
-      clearTimeout(pending.timer)
-      if (message.ok) pending.resolve(message.gates)
-      else pending.reject(new Error(message.error))
+      if (pending) {
+        slot.pending.delete(message.taskId)
+        clearTimeout(pending.timer)
+        if (message.ok) pending.resolve(message.gates)
+        else pending.reject(new Error(message.error))
+      }
+
+      if (slot.alive && message.rssBytes > this.maxWorkerRssBytes) {
+        this.recycleSlot(slot, `RSS ${message.rssBytes} byte(s) exceeded the ${this.maxWorkerRssBytes} byte threshold after task ${message.taskId}`)
+      }
     })
 
     worker.on('error', (error: Error) => {
@@ -116,6 +166,22 @@ export class WorkerPoolEvaluator {
       pending.reject(error)
     }
     slot.pending.clear()
+
+    if (this.closed) return
+    const index = this.slots.indexOf(slot)
+    if (index !== -1) this.slots[index] = this.spawnSlot()
+  }
+
+  /** Phase 13.3: a VOLUNTARY, healthy termination + respawn (unlike
+   *  handleSlotDeath, which reacts to an actual crash/error) - triggered
+   *  when a worker's reported RSS crosses maxWorkerRssBytes. Any OTHER
+   *  task still in flight on this slot is failed and falls back, same as
+   *  a real crash would - terminate() would strand it anyway. */
+  private recycleSlot(slot: WorkerSlot, reason: string): void {
+    if (!slot.alive) return
+    this.failAllPending(slot, new Error(`worker recycled: ${reason}`))
+    void slot.worker.terminate()
+    this.recycledWorkers++
 
     if (this.closed) return
     const index = this.slots.indexOf(slot)

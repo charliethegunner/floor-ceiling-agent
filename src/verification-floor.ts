@@ -36,11 +36,19 @@ export interface FloorReport<GateName extends string = string> {
 
 export async function runVerificationFloor<Candidate, GateName extends string = string>(
   floor: VerificationFloor<Candidate, GateName>,
-  candidate: Candidate
+  candidate: Candidate,
+  /** Optional, backward-compatible hook: called after each individual gate
+   *  resolves, with its outcome and real measured latency - lets a caller
+   *  (e.g. Phase 11.1's EngineTracer) record genuine per-gate timing without
+   *  every floor/candidate type needing to know about tracing itself. */
+  onGateComplete?: (gate: GateOutcome<GateName>, elapsedMs: number) => void
 ): Promise<FloorReport<GateName>> {
   const gates: GateOutcome<GateName>[] = []
   for (const gate of floor.gates) {
-    gates.push(await gate.check(candidate))
+    const start = Date.now()
+    const outcome = await gate.check(candidate)
+    onGateComplete?.(outcome, Date.now() - start)
+    gates.push(outcome)
   }
   return { ok: gates.every((g) => g.ok), domain: floor.domain, gates }
 }

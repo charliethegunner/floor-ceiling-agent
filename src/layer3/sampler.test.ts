@@ -3,6 +3,7 @@ import { ParallelCandidateSampler } from './sampler'
 import { TOPOLOGY_FLOOR, type TopologyCandidate } from '../topology-floor'
 import { WorkerPoolEvaluator } from '../layer1/worker-pool'
 import type { WorkerOffload } from './types'
+import { EngineTracer } from '../telemetry/tracer'
 
 // Fixtures mirroring the shapes already exercised in CeilingAgent.test.ts /
 // topology-floor.test.ts, kept self-contained (inMemoryFiles only) so this
@@ -251,4 +252,120 @@ describe('ParallelCandidateSampler: optional worker-pool offload (Phase 9)', () 
     expect(result.ok).toBe(true)
     expect(result.selected?.report.gates.every((g) => g.ok)).toBe(true)
   }, 15000)
+})
+
+// ---------------------------------------------------------------------------
+// Phase 11.1: optional EngineTracer wiring - a Best-of-N round records ONE
+// sampler_run span event summarizing the round (candidateCount, the winning
+// candidate's temperature, and whether early exit short-circuited it).
+// ---------------------------------------------------------------------------
+
+function samplerRunEvents(tracer: EngineTracer) {
+  const rootSpan = tracer.exportSpanJson().resourceSpans[0].scopeSpans[0].spans[0]
+  return rootSpan.events.filter((e) => e.name === 'sampler_run')
+}
+
+describe('ParallelCandidateSampler: optional EngineTracer wiring (Phase 11.1)', () => {
+  test('records one sampler_run event with the real candidate count and winning temperature', async () => {
+    const tracer = new EngineTracer()
+    tracer.startTrace('req-1', 'topology')
+    const sampler = new ParallelCandidateSampler<TopologyCandidate>({ sampleSize: 3, earlyExitOnSuccess: false }, undefined, tracer)
+    const candidates = [MISSING_EXPORT, GOOD, WORSE]
+
+    await sampler.evaluateBestOfN(async (_temperature, index) => candidates[index], TOPOLOGY_FLOOR)
+
+    const events = samplerRunEvents(tracer)
+    expect(events).toHaveLength(1)
+    expect(events[0].attributes).toContainEqual({ key: 'candidate_count', value: { intValue: 3 } })
+  })
+
+  test('shortCircuited is true when a fast winning candidate resolves before slower siblings settle', async () => {
+    // A genuine timing gap is needed to observe this: with near-instant
+    // (synchronous) candidates, resolving a promise doesn't immediately
+    // unwind the awaiting code - already-queued sibling .then() callbacks
+    // from the SAME microtask batch drain first, so "early exit" doesn't
+    // actually skip anything when every candidate finishes at essentially
+    // the same instant (honest, correct behavior - it's only a real
+    // optimization when candidates have real latency differences, exactly
+    // like genuine LLM network calls at different temperatures).
+    const tracer = new EngineTracer()
+    tracer.startTrace('req-1', 'topology')
+    const sampler = new ParallelCandidateSampler<TopologyCandidate>({ sampleSize: 3 }, undefined, tracer)
+
+    await sampler.evaluateBestOfN(async (_temperature, index) => {
+      if (index !== 0) await new Promise((resolve) => setTimeout(resolve, 50)) // slower siblings
+      return GOOD
+    }, TOPOLOGY_FLOOR)
+
+    const events = samplerRunEvents(tracer)
+    expect(events).toHaveLength(1)
+    const shortCircuited = events[0].attributes.find((a) => a.key === 'short_circuited')
+    expect(shortCircuited).toEqual({ key: 'short_circuited', value: { boolValue: true } })
+  })
+
+  test('shortCircuited is false when earlyExitOnSuccess is disabled', async () => {
+    const tracer = new EngineTracer()
+    tracer.startTrace('req-1', 'topology')
+    const sampler = new ParallelCandidateSampler<TopologyCandidate>({ sampleSize: 2, earlyExitOnSuccess: false }, undefined, tracer)
+
+    await sampler.evaluateBestOfN(async () => GOOD, TOPOLOGY_FLOOR)
+
+    const events = samplerRunEvents(tracer)
+    expect(events[0].attributes).toContainEqual({ key: 'short_circuited', value: { boolValue: false } })
+  })
+
+  test('without a tracer, evaluateBestOfN behaves exactly as before (regression guard)', async () => {
+    const sampler = new ParallelCandidateSampler<TopologyCandidate>({ sampleSize: 3 })
+    const result = await sampler.evaluateBestOfN(async () => GOOD, TOPOLOGY_FLOOR)
+    expect(result.ok).toBe(true)
+  })
+
+  test('emits a real floor_gate span per gate for the WINNING candidate only, sourced from real in-process verification', async () => {
+    const tracer = new EngineTracer()
+    tracer.startTrace('req-1', 'topology')
+    const sampler = new ParallelCandidateSampler<TopologyCandidate>({ sampleSize: 3, earlyExitOnSuccess: false }, undefined, tracer)
+    const candidates = [MISSING_EXPORT, GOOD, WORSE]
+
+    await sampler.evaluateBestOfN(async (_temperature, index) => candidates[index], TOPOLOGY_FLOOR)
+
+    const gateSpans = tracer.exportSpanJson().resourceSpans[0].scopeSpans[0].spans.slice(1)
+    // GOOD is the winner (index 1) - only its 3 real gates are traced, not
+    // MISSING_EXPORT's or WORSE's rejected attempts.
+    expect(gateSpans.map((s) => s.name)).toEqual(['floor_gate:exports', 'floor_gate:types', 'floor_gate:reachability'])
+    for (const span of gateSpans) {
+      expect(span.attributes).toContainEqual({ key: 'passed', value: { boolValue: true } })
+    }
+  })
+
+  test('worker-pool execution spans: gate timing genuinely measured inside the worker thread is preserved through to the trace', async () => {
+    const pool = trackedPool({ poolSize: 1 })
+    const tracer = new EngineTracer()
+    tracer.startTrace('req-1', 'topology')
+    const sampler = new ParallelCandidateSampler<TopologyCandidate>({ sampleSize: 1 }, topologyWorkerOffload(pool), tracer)
+
+    await sampler.evaluateBestOfN(async () => GOOD, TOPOLOGY_FLOOR)
+
+    const gateSpans = tracer.exportSpanJson().resourceSpans[0].scopeSpans[0].spans.slice(1)
+    expect(gateSpans.map((s) => s.name)).toEqual(['floor_gate:exports', 'floor_gate:types', 'floor_gate:reachability'])
+    for (const span of gateSpans) {
+      expect(span.attributes).toContainEqual({ key: 'passed', value: { boolValue: true } })
+      // A real (non-negative) measured duration, not a fabricated placeholder.
+      const startNanos = BigInt(span.startTimeUnixNano)
+      const endNanos = BigInt(span.endTimeUnixNano!)
+      expect(endNanos).toBeGreaterThanOrEqual(startNanos)
+    }
+  }, 15000)
+
+  test('a failing candidate produces an ERROR-status floor_gate span with real diagnostics', async () => {
+    const tracer = new EngineTracer()
+    tracer.startTrace('req-1', 'topology')
+    const sampler = new ParallelCandidateSampler<TopologyCandidate>({ sampleSize: 1 }, undefined, tracer)
+
+    await sampler.evaluateBestOfN(async () => MISSING_EXPORT, TOPOLOGY_FLOOR)
+
+    const gateSpans = tracer.exportSpanJson().resourceSpans[0].scopeSpans[0].spans.slice(1)
+    const exportsSpan = gateSpans.find((s) => s.name === 'floor_gate:exports')
+    expect(exportsSpan?.status).toEqual({ code: 2 })
+    expect(exportsSpan?.attributes.find((a) => a.key === 'diagnostics')).toBeDefined()
+  })
 })

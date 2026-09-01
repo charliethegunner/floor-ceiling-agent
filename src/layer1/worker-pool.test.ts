@@ -1,6 +1,9 @@
 import { describe, expect, test, afterEach } from 'vitest'
 import os from 'node:os'
-import { WorkerPoolEvaluator, type WorkerGateOutcome } from './worker-pool'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { WorkerPoolEvaluator, ProjectPackIngestor, toWorkspaceFiles, type WorkerGateOutcome } from './worker-pool'
 import type { TopologyCandidate } from '../topology-floor'
 import type { ClaimCandidate } from '../claim-floor'
 import type { SpatialCandidate } from '../spatial-floor'
@@ -118,6 +121,98 @@ describe('WorkerPoolEvaluator: genuinely offloads real verification to a worker 
       expect(gates.every((g) => g.ok)).toBe(true)
     }
   }, 20000)
+})
+
+describe('WorkerPoolEvaluator: Phase 12.0 workspaceFiles gives topology tasks real multi-file repository context', () => {
+  test('a candidate that fails reachability alone (its dependency is missing) passes once a real ingested workspace supplies that dependency', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'worker-pool-ingest-'))
+    try {
+      writeFileSync(join(workspace, 'b.ts'), 'export function b(): number { return 2 }\n')
+
+      const candidate: TopologyCandidate = {
+        inMemoryFiles: { 'a.ts': "import { b } from './b'\nexport function a(): number { return b() }\n" },
+        expectedExports: [{ filePath: 'a.ts', exportedNames: ['a'] }],
+        reachability: [{ from: { filePath: 'a.ts', functionName: 'a' }, to: { filePath: 'b.ts', functionName: 'b' }, expectReachable: true }],
+      }
+
+      const pool = trackedPool({ poolSize: 1 })
+
+      // Without repository context, a.ts's own import of './b' can't
+      // resolve to anything - a genuine reachability failure, not a
+      // contrived one.
+      const withoutContext = await pool.verify({ domain: 'topology', candidateText: JSON.stringify(candidate) }, NEVER_CALLED)
+      expect(withoutContext.find((g) => g.gate === 'reachability')?.ok).toBe(false)
+
+      // Real ingestion of a real directory on disk, through the exact
+      // ProjectPackIngestor/toWorkspaceFiles surface worker-pool.ts
+      // re-exports.
+      const graph = await new ProjectPackIngestor().ingestWorkspace(workspace)
+      const workspaceFiles = toWorkspaceFiles(graph)
+      expect(workspaceFiles['b.ts']).toContain('export function b')
+
+      const withContext = await pool.verify({ domain: 'topology', candidateText: JSON.stringify(candidate), workspaceFiles }, NEVER_CALLED)
+      expect(withContext.every((g) => g.ok)).toBe(true)
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  }, 15000)
+
+  test("the candidate's own file wins over workspaceFiles on a path collision", async () => {
+    const pool = trackedPool({ poolSize: 1 })
+    const candidate: TopologyCandidate = {
+      inMemoryFiles: { 'a.ts': 'export function a(): number { return 1 }' },
+      expectedExports: [{ filePath: 'a.ts', exportedNames: ['a'] }],
+      reachability: [],
+    }
+    // workspaceFiles supplies a conflicting, broken version of a.ts (no
+    // export) - the candidate's own real a.ts must still be what gets
+    // verified.
+    const gates = await pool.verify(
+      { domain: 'topology', candidateText: JSON.stringify(candidate), workspaceFiles: { 'a.ts': 'function a(): number { return 999 }' } },
+      NEVER_CALLED
+    )
+    expect(gates.every((g) => g.ok)).toBe(true)
+  }, 15000)
+})
+
+describe('WorkerPoolEvaluator: Phase 13.3 worker RSS monitoring and recycling', () => {
+  const VALID_SPHERE = { surface: { type: 'sphere', center: [0, 0, 0], radius: 1 }, boundingBox: { min: [-2, -2, -2], max: [2, 2, 2] } }
+
+  test('a worker reporting RSS above maxWorkerRssBytes is proactively terminated and respawned, and the pool keeps working', async () => {
+    const pool = trackedPool({ poolSize: 1, maxWorkerRssBytes: 1000 })
+
+    // __testFakeRssBytes is test-only instrumentation (worker-pool-worker.ts)
+    // that reports a fabricated RSS instead of the real reading, so this is
+    // deterministic without actually allocating hundreds of MB.
+    const gates = await pool.verify({ domain: 'spatial', candidateText: JSON.stringify(VALID_SPHERE), __testFakeRssBytes: 999_999_999 }, NEVER_CALLED)
+    expect(gates.every((g) => g.ok)).toBe(true) // the task itself still succeeded before recycling happened
+    expect(pool.recycledWorkerCount).toBe(1)
+
+    // The respawned worker is genuinely functional.
+    const recoveryGates = await pool.verify({ domain: 'spatial', candidateText: JSON.stringify(VALID_SPHERE) }, NEVER_CALLED)
+    expect(recoveryGates.every((g) => g.ok)).toBe(true)
+  }, 15000)
+
+  test('RSS at or below maxWorkerRssBytes never triggers recycling', async () => {
+    const pool = trackedPool({ poolSize: 1, maxWorkerRssBytes: 1000 })
+    await pool.verify({ domain: 'spatial', candidateText: JSON.stringify(VALID_SPHERE), __testFakeRssBytes: 1000 }, NEVER_CALLED)
+    expect(pool.recycledWorkerCount).toBe(0)
+  }, 15000)
+
+  test('defaults maxWorkerRssBytes to 512MB (empirically justified - see DEFAULT_MAX_WORKER_RSS_BYTES\'s comment)', async () => {
+    const pool = trackedPool({ poolSize: 1 })
+    await pool.verify({ domain: 'spatial', candidateText: JSON.stringify(VALID_SPHERE), __testFakeRssBytes: 512 * 1024 * 1024 - 1 }, NEVER_CALLED)
+    expect(pool.recycledWorkerCount).toBe(0)
+
+    await pool.verify({ domain: 'spatial', candidateText: JSON.stringify(VALID_SPHERE), __testFakeRssBytes: 512 * 1024 * 1024 + 1 }, NEVER_CALLED)
+    expect(pool.recycledWorkerCount).toBe(1)
+  }, 15000)
+
+  test('a real (non-fake) task reports a genuine positive RSS reading and does not spuriously recycle a healthy worker under normal operation', async () => {
+    const pool = trackedPool({ poolSize: 1 })
+    await pool.verify({ domain: 'spatial', candidateText: JSON.stringify(VALID_SPHERE) }, NEVER_CALLED)
+    expect(pool.recycledWorkerCount).toBe(0)
+  }, 15000)
 })
 
 describe('WorkerPoolEvaluator: task timeout handling', () => {

@@ -1,5 +1,6 @@
 import { runVerificationFloor, type VerificationFloor, type FloorReport, type GateOutcome } from '../verification-floor'
 import type { SamplerConfig, Candidate, CandidateEvaluation, BestOfNResult, WorkerOffload } from './types'
+import type { EngineTracer } from '../telemetry/tracer'
 
 const DEFAULT_CONFIG: SamplerConfig = {
   sampleSize: 3,
@@ -17,10 +18,12 @@ const DEFAULT_CONFIG: SamplerConfig = {
 export class ParallelCandidateSampler<TCandidate, GateName extends string = string> {
   private readonly config: SamplerConfig
   private readonly workerOffload?: WorkerOffload<TCandidate>
+  private readonly tracer?: EngineTracer
 
-  constructor(config: Partial<SamplerConfig> = {}, workerOffload?: WorkerOffload<TCandidate>) {
+  constructor(config: Partial<SamplerConfig> = {}, workerOffload?: WorkerOffload<TCandidate>, tracer?: EngineTracer) {
     this.config = { ...DEFAULT_CONFIG, ...config }
     this.workerOffload = workerOffload
+    this.tracer = tracer
   }
 
   private computeTemperatures(): number[] {
@@ -87,18 +90,37 @@ export class ParallelCandidateSampler<TCandidate, GateName extends string = stri
   // internally - a dead worker, a timeout, pool shutdown) runs the SAME
   // in-process runVerificationFloor path as before Phase 9. Callers that
   // never pass workerOffload get byte-identical behavior to pre-Phase-9.
-  private async runFloor(floor: VerificationFloor<TCandidate, GateName>, payload: TCandidate): Promise<FloorReport<GateName>> {
-    const fallback = () => runVerificationFloor(floor, payload)
+  //
+  // onGateComplete (Phase 11.1) is forwarded from BOTH branches with real
+  // measured latency - the worker branch's timing comes from
+  // WorkerGateOutcome.elapsedMs, genuinely measured inside the worker
+  // thread by worker-pool-worker.ts's own runVerificationFloor call, not
+  // approximated after the fact from the round-trip time.
+  private async runFloor(
+    floor: VerificationFloor<TCandidate, GateName>,
+    payload: TCandidate,
+    onGateComplete?: (gate: GateOutcome<GateName>, elapsedMs: number) => void
+  ): Promise<FloorReport<GateName>> {
+    const runLocally = async (): Promise<GateOutcome<GateName>[]> => {
+      const timings: Array<{ gate: GateOutcome<GateName>; elapsedMs: number }> = []
+      await runVerificationFloor(floor, payload, (gate, elapsedMs) => timings.push({ gate, elapsedMs }))
+      timings.forEach(({ gate, elapsedMs }) => onGateComplete?.(gate, elapsedMs))
+      return timings.map(({ gate }) => gate)
+    }
 
     if (this.workerOffload) {
       const task = this.workerOffload.toTask(payload)
       if (task) {
-        const gates = await this.workerOffload.pool.verify(task, async () => (await fallback()).gates)
+        const gates = await this.workerOffload.pool.verify(task, runLocally)
+        for (const gate of gates) {
+          onGateComplete?.(gate as GateOutcome<GateName>, (gate as { elapsedMs?: number }).elapsedMs ?? 0)
+        }
         return { ok: gates.every((g) => g.ok), domain: floor.domain, gates: gates as GateOutcome<GateName>[] }
       }
     }
 
-    return fallback()
+    const gates = await runLocally()
+    return { ok: gates.every((g) => g.ok), domain: floor.domain, gates }
   }
 
   async evaluateBestOfN(
@@ -108,11 +130,25 @@ export class ParallelCandidateSampler<TCandidate, GateName extends string = stri
     const start = Date.now()
     const temperatures = this.computeTemperatures()
 
+    // Buffers each candidate's real per-gate timing by index, so that
+    // AFTER the winner is chosen, only ITS gates get replayed into the
+    // tracer as real floor_gate spans - not every rejected sample's, which
+    // would make Best-of-N traces N times noisier than the single-shot path
+    // for no benefit (only the winner's gates actually decided the result).
+    const gateTimingsByIndex = this.tracer ? new Map<number, Array<{ gate: GateOutcome<GateName>; elapsedMs: number }>>() : undefined
+
     const evaluate = async (temperature: number, index: number): Promise<CandidateEvaluation<TCandidate, GateName>> => {
       const payload = await generatorFn(temperature, index)
       const candidate: Candidate<TCandidate> = { index, temperature, payload }
+      const onGateComplete = gateTimingsByIndex
+        ? (gate: GateOutcome<GateName>, elapsedMs: number) => {
+            const timings = gateTimingsByIndex.get(index) ?? []
+            timings.push({ gate, elapsedMs })
+            gateTimingsByIndex.set(index, timings)
+          }
+        : undefined
       const gateStart = Date.now()
-      const report = await this.runFloor(floor, payload)
+      const report = await this.runFloor(floor, payload, onGateComplete)
       const elapsedMs = Date.now() - gateStart
       return { candidate, report, score: this.score(report, elapsedMs), elapsedMs }
     }
@@ -120,6 +156,19 @@ export class ParallelCandidateSampler<TCandidate, GateName extends string = stri
     const evaluations = await this.runEvaluations(temperatures, evaluate)
     evaluations.sort((a, b) => b.score - a.score)
     const selected = evaluations.find((e) => e.report.ok) ?? evaluations[0]
+
+    // "Short-circuited" means early exit actually saved work this round -
+    // it resolved before every sampled candidate settled, not merely that
+    // the option was enabled.
+    const shortCircuited = this.config.earlyExitOnSuccess && evaluations.length < temperatures.length
+    this.tracer?.recordSamplerRun(evaluations.length, selected?.candidate.temperature, shortCircuited)
+
+    if (this.tracer && selected && gateTimingsByIndex) {
+      const timings = gateTimingsByIndex.get(selected.candidate.index) ?? []
+      for (const { gate, elapsedMs } of timings) {
+        this.tracer.recordFloorGate(gate.gate, gate.ok, elapsedMs, gate.ok ? undefined : gate.details)
+      }
+    }
 
     return {
       ok: evaluations.some((e) => e.report.ok),

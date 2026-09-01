@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { mkdtempSync, readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { MetaKernelCompiler, classifyFailurePattern, derivePatch } from './meta-kernel'
@@ -109,7 +109,9 @@ describe('MetaKernelCompiler: persistence to a local JSON rule store', () => {
     kernel.recordFix(pattern, derivePatch(pattern, '{}', '{}'))
 
     const stored = JSON.parse(readFileSync(storePath, 'utf-8'))
-    expect(stored[pattern]).toMatchObject({ kind: 'topology-add-export' })
+    expect(stored[pattern].patch).toMatchObject({ kind: 'topology-add-export' })
+    expect(stored[pattern].confidence).toBe(1)
+    expect(typeof stored[pattern].lastUsedAt).toBe('number')
   })
 
   test('a new compiler instance pointed at the same storePath loads previously recorded rules', () => {
@@ -134,6 +136,100 @@ describe('MetaKernelCompiler: persistence to a local JSON rule store', () => {
     const kernel = new MetaKernelCompiler()
     kernel.recordFix('p', derivePatch('p', 'x', 'y'))
     expect(kernel.ruleCount).toBe(1) // just proving it works without a storePath at all
+  })
+
+  test('a compiler loading a pre-Phase-13.1 store (bare CandidatePatch, no confidence/lastUsedAt wrapper) still works', () => {
+    const storePath = freshStorePath()
+    const pattern = 'instruction:symbolic:expected-got'
+    writeFileSync(storePath, JSON.stringify({ [pattern]: derivePatch(pattern, 'ADD X0, X1, X0', 'ADD X0, X0, X1') }))
+
+    const kernel = new MetaKernelCompiler({ storePath })
+    expect(kernel.ruleCount).toBe(1)
+    const fixed = kernel.tryMatchRule(pattern, {
+      failingCandidate: 'SUB X2, X0, X2',
+      failedGate: { gate: 'symbolic', details: 'expected "SUB X2, X2, X0", got "SUB X2, X0, X2"' },
+    })
+    expect(fixed).toBe('SUB X2, X2, X0')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 13.1: LRU eviction & confidence bounds. maxRules is deliberately
+// tiny in these tests so eviction is exercised without recording thousands
+// of rules.
+// ---------------------------------------------------------------------------
+
+describe('MetaKernelCompiler: Phase 13.1 bounded capacity and LRU eviction', () => {
+  test('recording one more pattern than maxRules evicts the least-recently-used rule when all confidences tie', () => {
+    const kernel = new MetaKernelCompiler({ maxRules: 3 })
+    kernel.recordFix('A', derivePatch('A', 'x', 'y'))
+    kernel.recordFix('B', derivePatch('B', 'x', 'y'))
+    kernel.recordFix('C', derivePatch('C', 'x', 'y'))
+    expect(kernel.ruleCount).toBe(3)
+
+    kernel.recordFix('D', derivePatch('D', 'x', 'y')) // 4th distinct pattern -> eviction
+
+    expect(kernel.ruleCount).toBe(3)
+    expect(kernel.evictedCount).toBe(1)
+    // A was recorded first (oldest lastUsedAt, same confidence as everyone else) -> evicted.
+    expect(kernel.tryMatchRule('A', { failingCandidate: 'x', failedGate: { gate: 'g', details: '' } })).toBeNull()
+    expect(kernel.tryMatchRule('D', { failingCandidate: 'x', failedGate: { gate: 'g', details: '' } })).not.toBeNull()
+  })
+
+  test('a lower-confidence rule is evicted before a higher-confidence rule, even if the low-confidence one is more recent', () => {
+    const kernel = new MetaKernelCompiler({ maxRules: 2 })
+    const pattern = 'instruction:symbolic:expected-got'
+    const A = classifyFailurePattern('instruction', { gate: 'symbolic', details: 'expected "X", got "Y"' }, 'Y')
+
+    kernel.recordFix(A, derivePatch(pattern, 'ADD X0, X1, X0', 'ADD X0, X0, X1'))
+    kernel.recordFix(A, derivePatch(pattern, 'ADD X0, X1, X0', 'ADD X0, X0, X1')) // re-taught -> confidence 2
+    kernel.recordFix(A, derivePatch(pattern, 'ADD X0, X1, X0', 'ADD X0, X0, X1')) // re-taught -> confidence 3
+    kernel.recordFix('B', derivePatch('B', 'x', 'y')) // confidence 1, more recent than A
+
+    expect(kernel.ruleCount).toBe(2) // no eviction yet - still at capacity, not over it
+
+    kernel.recordFix('C', derivePatch('C', 'x', 'y')) // 3rd distinct pattern -> eviction
+
+    expect(kernel.ruleCount).toBe(2)
+    // B (confidence 1) loses to A (confidence 3) despite being more recent than A.
+    expect(kernel.tryMatchRule('B', { failingCandidate: 'x', failedGate: { gate: 'g', details: '' } })).toBeNull()
+    expect(kernel.tryMatchRule('C', { failingCandidate: 'x', failedGate: { gate: 'g', details: '' } })).not.toBeNull()
+    const stillFixed = kernel.tryMatchRule(A, {
+      failingCandidate: 'SUB X2, X0, X2',
+      failedGate: { gate: 'symbolic', details: 'expected "SUB X2, X2, X0", got "SUB X2, X0, X2"' },
+    })
+    expect(stillFixed).toBe('SUB X2, X2, X0')
+  })
+
+  test('a real tryMatchRule hit raises confidence and recency enough to outlive an otherwise-newer, never-reused rule', () => {
+    const kernel = new MetaKernelCompiler({ maxRules: 2 })
+    const pattern = 'instruction:symbolic:expected-got'
+    const A = classifyFailurePattern('instruction', { gate: 'symbolic', details: 'expected "X", got "Y"' }, 'Y')
+
+    kernel.recordFix(A, derivePatch(pattern, 'ADD X0, X1, X0', 'ADD X0, X0, X1')) // confidence 1, oldest
+    kernel.recordFix('Z', derivePatch('Z', 'x', 'y')) // confidence 1, newer than A
+
+    // A genuinely fires and generalizes to a new failure - real usage evidence.
+    const fixed = kernel.tryMatchRule(A, {
+      failingCandidate: 'SUB X2, X0, X2',
+      failedGate: { gate: 'symbolic', details: 'expected "SUB X2, X2, X0", got "SUB X2, X0, X2"' },
+    })
+    expect(fixed).toBe('SUB X2, X2, X0') // A now has confidence 2, more recent than Z
+
+    kernel.recordFix('W', derivePatch('W', 'x', 'y')) // 3rd distinct pattern -> eviction
+
+    // Z (confidence 1, never reused) loses to A (confidence 2, earned via real use).
+    expect(kernel.tryMatchRule('Z', { failingCandidate: 'x', failedGate: { gate: 'g', details: '' } })).toBeNull()
+    expect(kernel.ruleCount).toBe(2)
+  })
+
+  test('defaults to a 1000-rule capacity when maxRules is not specified', () => {
+    const kernel = new MetaKernelCompiler()
+    for (let i = 0; i < 1001; i++) {
+      kernel.recordFix(`pattern-${i}`, derivePatch(`pattern-${i}`, 'x', 'y'))
+    }
+    expect(kernel.ruleCount).toBe(1000)
+    expect(kernel.evictedCount).toBe(1)
   })
 })
 

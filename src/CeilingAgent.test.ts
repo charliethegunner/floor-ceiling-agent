@@ -17,6 +17,7 @@ import type { ClaimCandidate } from './claim-floor'
 import type { SpatialCandidate } from './spatial-floor'
 import { WorkerPoolEvaluator } from './layer1/worker-pool'
 import { MetaKernelCompiler, classifyFailurePattern } from './layer5/meta-kernel'
+import { EngineTracer } from './telemetry/tracer'
 
 class ScriptedLlmClient implements LlmClient {
   private index = 0
@@ -1144,5 +1145,191 @@ describe('runCeilingAgent: Layer 5 Meta-Kernel zero-latency rule bypass (Phase 1
     expect(result.ok).toBe(true)
     expect(result.attempts).toBe(2)
     expect(result.result).toBe('export function ok(): number { return 1 }')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 11.1: optional EngineTracer wiring (src/telemetry/tracer.ts) - real
+// per-gate spans and meta-kernel/sampler events, not fabricated placeholder
+// data. Off by default (options.tracer undefined), so every existing test
+// above is unaffected.
+// ---------------------------------------------------------------------------
+
+function rootSpanOf(tracer: EngineTracer) {
+  return tracer.exportSpanJson().resourceSpans[0].scopeSpans[0].spans[0]
+}
+
+function gateSpansOf(tracer: EngineTracer) {
+  return tracer.exportSpanJson().resourceSpans[0].scopeSpans[0].spans.slice(1)
+}
+
+describe('runCeilingAgent: optional EngineTracer wiring (Phase 11.1)', () => {
+  test('a successful single-shot round emits one real floor_gate child span per gate, in order', async () => {
+    const tracer = new EngineTracer()
+    const llm = new ScriptedLlmClient(['MOV X0, X1'])
+
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { tracer })
+
+    expect(result.ok).toBe(true)
+    const gateSpans = gateSpansOf(tracer)
+    expect(gateSpans.map((s) => s.name)).toEqual(['floor_gate:static', 'floor_gate:fuzz', 'floor_gate:symbolic'])
+    for (const span of gateSpans) {
+      expect(span.attributes).toContainEqual({ key: 'passed', value: { boolValue: true } })
+    }
+  })
+
+  test('the root span carries the requestId and domain, and closes with status OK on success', async () => {
+    const tracer = new EngineTracer()
+    const llm = new ScriptedLlmClient(['MOV X0, X1'])
+
+    await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { tracer })
+
+    const root = rootSpanOf(tracer)
+    expect(root.name).toBe('runCeilingAgent:instruction')
+    expect(root.attributes.find((a) => a.key === 'ceiling.request_id')).toBeDefined()
+    expect(root.status).toEqual({ code: 1 })
+  })
+
+  test('a failing gate produces a floor_gate span with status ERROR and the real failure diagnostics', async () => {
+    const tracer = new EngineTracer()
+    const llm = new ScriptedLlmClient(['garbage', 'garbage'])
+
+    await expect(runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { maxRetries: 2, tracer })).rejects.toThrow(CeilingAgentExhaustedError)
+
+    const gateSpans = gateSpansOf(tracer)
+    const failedSpan = gateSpans.find((s) => s.status.code === 2)
+    expect(failedSpan).toBeDefined()
+    expect(failedSpan?.attributes.find((a) => a.key === 'diagnostics')).toBeDefined()
+  })
+
+  test('combined with bestOfN, a sampler_run event is recorded with the real candidate count', async () => {
+    const tracer = new EngineTracer()
+    const llm = new TemperatureRoutedLlmClient((t) => (t === 0.8 ? JSON.stringify(GOOD_TOPOLOGY_CANDIDATE) : JSON.stringify(TOPOLOGY_CANDIDATE_WITH_MISSING_EXPORT)))
+
+    const result = await runCeilingAgent({ kind: 'topology', description: 'a module a.ts that calls b.ts#b' }, llm, { bestOfN: {}, tracer })
+
+    expect(result.ok).toBe(true)
+    const root = rootSpanOf(tracer)
+    const samplerEvents = root.events.filter((e) => e.name === 'sampler_run')
+    expect(samplerEvents).toHaveLength(1)
+    expect(samplerEvents[0].attributes).toContainEqual({ key: 'candidate_count', value: { intValue: 4 } })
+
+    // The Best-of-N path routes real per-domain verification through
+    // runBestOfNRound's synthetic single-gate wrapper (see its own
+    // comments) - the sampler faithfully traces THAT floor, so this is one
+    // 'combined' span for the winning candidate, not the 3 real
+    // 'exports'/'types'/'reachability' gate names the single-shot path
+    // would show (an honest reflection of what the sampler actually sees).
+    const gateSpans = gateSpansOf(tracer)
+    expect(gateSpans.map((s) => s.name)).toEqual(['floor_gate:combined'])
+    expect(gateSpans[0].attributes).toContainEqual({ key: 'passed', value: { boolValue: true } })
+  })
+
+  test('combined with metaKernel, a bypass emits both a meta_kernel_check hit event and real gate spans for the patched candidate', async () => {
+    const metaKernel = new MetaKernelCompiler()
+    const teachLlm = new ScriptedLlmClient(['ADD X0, X1, X0', 'ADD X0, X0, X1'])
+    await runCeilingAgent({ kind: 'instruction', description: 'ADD RAX, RBX' }, teachLlm, { metaKernel })
+
+    const tracer = new EngineTracer()
+    const bypassLlm = new OnceOnlyLlmClient('SUB X2, X0, X2')
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'SUB RCX, RAX' }, bypassLlm, { metaKernel, tracer })
+
+    expect(result.ok).toBe(true)
+    const root = rootSpanOf(tracer)
+    const metaKernelEvents = root.events.filter((e) => e.name === 'meta_kernel_check')
+    expect(metaKernelEvents).toHaveLength(1)
+    expect(metaKernelEvents[0].attributes).toContainEqual({ key: 'hit', value: { boolValue: true } })
+
+    // Both attempt 1 (the failing bypassLlm candidate) AND attempt 2 (the
+    // meta-kernel-patched, passing candidate) go through real floor
+    // verification and both get traced - a bad attempt's gates are just as
+    // real/worth recording as a good one's. The LAST 3 gate spans are the
+    // successful bypass round.
+    const gateSpans = gateSpansOf(tracer)
+    expect(gateSpans).toHaveLength(6)
+    expect(gateSpans.map((s) => s.name)).toEqual(['floor_gate:static', 'floor_gate:fuzz', 'floor_gate:symbolic', 'floor_gate:static', 'floor_gate:fuzz', 'floor_gate:symbolic'])
+    const bypassRoundSpans = gateSpans.slice(3)
+    for (const span of bypassRoundSpans) {
+      expect(span.attributes).toContainEqual({ key: 'passed', value: { boolValue: true } })
+    }
+  }, 15000)
+
+  test('without a tracer, behavior is unaffected (regression guard)', async () => {
+    const llm = new ScriptedLlmClient(['MOV X0, X1'])
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm)
+    expect(result.ok).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 11.4: optional options.formatResponse wiring
+// (src/telemetry/output-formatter.ts) - resolvedLayer is computed from
+// runCeilingAgent's own ground-truth control flow (which branch actually
+// produced the winning candidate), never inferred from trace events. Off by
+// default, so every existing test above is unaffected.
+// ---------------------------------------------------------------------------
+
+describe('runCeilingAgent: optional formatResponse wiring (Phase 11.4)', () => {
+  test('without formatResponse, result.formatted is undefined (regression guard)', async () => {
+    const llm = new ScriptedLlmClient(['MOV X0, X1'])
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm)
+    expect(result.formatted).toBeUndefined()
+  })
+
+  test('a first-try pass resolves via layer1-floor with an empty diff', async () => {
+    const llm = new ScriptedLlmClient(['MOV X0, X1'])
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { formatResponse: true })
+
+    expect(result.formatted?.summary.outcome).toBe('PASS')
+    expect(result.formatted?.summary.resolvedLayer).toBe('layer1-floor')
+    expect(result.formatted?.structuralDiff).toEqual([])
+    expect(result.formatted?.verificationTraces.map((t) => t.gate)).toEqual(['static', 'fuzz', 'symbolic'])
+  })
+
+  test('a self-healed retry (no bestOfN, no metaKernel) resolves via layer4-healing with a real before/after diff', async () => {
+    const llm = new ScriptedLlmClient(['MOV X1, X0', 'MOV X0, X1'])
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { formatResponse: true })
+
+    expect(result.formatted?.summary.resolvedLayer).toBe('layer4-healing')
+    expect(result.formatted?.structuralDiff).toEqual([
+      { type: 'remove', text: 'MOV X1, X0' },
+      { type: 'add', text: 'MOV X0, X1' },
+    ])
+  })
+
+  test('a Best-of-N win resolves via layer3-sampler', async () => {
+    const llm = new TemperatureRoutedLlmClient((t) => (t === 0.8 ? 'MOV X0, X1' : 'MOV X1, X0'))
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { bestOfN: {}, formatResponse: true })
+
+    expect(result.formatted?.summary.resolvedLayer).toBe('layer3-sampler')
+  })
+
+  test('a meta-kernel bypass resolves via layer5-meta-kernel, and telemetry is populated when a tracer is also supplied', async () => {
+    const metaKernel = new MetaKernelCompiler()
+    const teachLlm = new ScriptedLlmClient(['ADD X0, X1, X0', 'ADD X0, X0, X1'])
+    await runCeilingAgent({ kind: 'instruction', description: 'ADD RAX, RBX' }, teachLlm, { metaKernel })
+
+    const tracer = new EngineTracer()
+    const bypassLlm = new OnceOnlyLlmClient('SUB X2, X0, X2')
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'SUB RCX, RAX' }, bypassLlm, { metaKernel, tracer, formatResponse: true })
+
+    expect(result.formatted?.summary.resolvedLayer).toBe('layer5-meta-kernel')
+    expect(result.formatted?.telemetry.traceId).toBeDefined()
+    expect(result.formatted?.telemetry.gateSpanCount).toBeGreaterThan(0)
+  }, 15000)
+
+  test('an exhausted (FAIL) run attaches formatted with a FAIL summary and no resolvedLayer', async () => {
+    const llm = new ScriptedLlmClient(['garbage', 'garbage'])
+
+    try {
+      await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { maxRetries: 2, formatResponse: true })
+      expect.unreachable('expected runCeilingAgent to throw')
+    } catch (error) {
+      expect(error).toBeInstanceOf(CeilingAgentExhaustedError)
+      const exhausted = error as CeilingAgentExhaustedError
+      expect(exhausted.report.formatted?.summary.outcome).toBe('FAIL')
+      expect(exhausted.report.formatted?.summary.resolvedLayer).toBeUndefined()
+      expect(exhausted.report.formatted?.verificationTraces).toHaveLength(2)
+    }
   })
 })

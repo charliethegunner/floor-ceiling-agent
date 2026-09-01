@@ -1,4 +1,5 @@
 import type { VerificationFloor, VerificationGate, GateOutcome } from './verification-floor'
+import { startDeadlineClock, isDeadlineExceeded, SOLVER_DEADLINE_DIAGNOSTIC, DEFAULT_SOLVER_DEADLINE_MS } from './layer1/verification-floors'
 
 // A concrete VerificationFloor (src/verification-floor.ts) for continuous
 // implicit surfaces expressed as Signed Distance Functions (SDFs) - spatial
@@ -96,6 +97,8 @@ export interface SpatialCandidate {
   gridResolution?: number
   /** Upper bound on sampled gradient magnitude. Defaults to 1.05 - a true SDF is exactly 1-Lipschitz (Eikonal |∇f|=1); the small margin absorbs finite-difference error, not a design tolerance. */
   maxGradientMagnitude?: number
+  /** Phase 13.2: overrides the default 500ms wall-clock bound on the continuity/self-intersection grid scans (see layer1/verification-floors.ts). */
+  solverDeadlineMs?: number
 }
 
 export type SpatialGateName = 'continuity' | 'volumetric-bound' | 'self-intersection'
@@ -200,10 +203,19 @@ const DEFAULT_MAX_GRADIENT_MAGNITUDE = 1.05
 function checkContinuity(candidate: SpatialCandidate): GateOutcome<'continuity'> {
   const resolution = candidate.gridResolution ?? DEFAULT_GRID_RESOLUTION
   const maxGradient = candidate.maxGradientMagnitude ?? DEFAULT_MAX_GRADIENT_MAGNITUDE
+  // Phase 13.2: a cooperative wall-clock check, not Promise.race - this loop
+  // is synchronous, and single-threaded JS cannot preempt it mid-iteration;
+  // see layer1/verification-floors.ts's header comment for why this is the
+  // real (not fabricated) bound for CPU-bound synchronous work like a large
+  // candidate.gridResolution.
+  const clock = startDeadlineClock(candidate.solverDeadlineMs ?? DEFAULT_SOLVER_DEADLINE_MS)
 
   let worst = 0
   let worstPoint: Vec3 = [0, 0, 0]
   for (const p of sampleGrid(candidate.boundingBox, resolution)) {
+    if (isDeadlineExceeded(clock)) {
+      return { gate: 'continuity', ok: false, details: SOLVER_DEADLINE_DIAGNOSTIC }
+    }
     const magnitude = lengthVec(estimateGradient(candidate.surface, p))
     if (magnitude > worst) {
       worst = magnitude
@@ -373,10 +385,14 @@ function checkSelfIntersection(candidate: SpatialCandidate): GateOutcome<'self-i
   }
 
   const resolution = candidate.gridResolution ?? DEFAULT_GRID_RESOLUTION
+  const clock = startDeadlineClock(candidate.solverDeadlineMs ?? DEFAULT_SOLVER_DEADLINE_MS)
   let singularPoint: Vec3 | undefined
   let singularMagnitude = Infinity
 
   for (const p of sampleGrid(candidate.boundingBox, resolution)) {
+    if (isDeadlineExceeded(clock)) {
+      return { gate: 'self-intersection', ok: false, details: SOLVER_DEADLINE_DIAGNOSTIC }
+    }
     const value = evaluateSdf(candidate.surface, p)
     if (Math.abs(value) > SELF_INTERSECTION_SURFACE_EPSILON) continue // not near the surface
 

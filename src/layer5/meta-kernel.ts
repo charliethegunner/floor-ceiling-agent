@@ -247,22 +247,56 @@ function applyPatch(patch: CandidatePatch, context: MatchContext): string | null
 // knowledge base" - the request's own "SQLite / JSON" phrasing treats them
 // as interchangeable). storePath is optional specifically so tests (and any
 // caller that wants a purely in-memory, no-fs-I/O instance) can opt out.
+//
+// Phase 13.1: bounded capacity (default 1,000 rules) with LRU eviction, so
+// a long-running process can't accumulate an unbounded rule store. Each
+// stored rule carries a `confidence` (real usage evidence, not a fabricated
+// score: it starts at 1 when first taught, and increments every time this
+// SAME pattern is either re-taught via recordFix or successfully matched
+// via tryMatchRule - i.e. genuinely re-used) and a `lastUsedAt` logical
+// tick (an internal monotonic counter, not Date.now() - avoids ties from
+// millisecond-granularity clock resolution when many rules are touched in
+// quick succession, which is common in tests and in bursty real usage).
+// Eviction picks the LOWEST confidence rule; ties are broken by the
+// LEAST-RECENTLY-USED (smallest lastUsedAt), matching the requested
+// "lowest confidence / least-recently-used" combined policy exactly.
 // ---------------------------------------------------------------------------
 
 export interface MetaKernelOptions {
   storePath?: string
+  /** Max distinct failure patterns retained. Recording one more than this evicts the lowest-confidence (ties: least-recently-used) rule first. Default 1000. */
+  maxRules?: number
+}
+
+interface StoredRule {
+  patch: CandidatePatch
+  confidence: number
+  lastUsedAt: number
+}
+
+const DEFAULT_MAX_RULES = 1000
+
+function isStoredRule(value: unknown): value is StoredRule {
+  return typeof value === 'object' && value !== null && 'patch' in value && 'confidence' in value && 'lastUsedAt' in value
 }
 
 export class MetaKernelCompiler {
-  private readonly store = new Map<string, CandidatePatch>()
+  private readonly store = new Map<string, StoredRule>()
   private readonly storePath: string | undefined
+  private readonly maxRules: number
+  private accessCounter = 0
+  private evictedRuleCount = 0
 
   constructor(options: MetaKernelOptions = {}) {
     this.storePath = options.storePath
+    this.maxRules = options.maxRules ?? DEFAULT_MAX_RULES
     if (this.storePath && existsSync(this.storePath)) {
-      const raw = JSON.parse(readFileSync(this.storePath, 'utf-8')) as Record<string, CandidatePatch>
-      for (const [pattern, patch] of Object.entries(raw)) {
-        this.store.set(pattern, patch)
+      const raw = JSON.parse(readFileSync(this.storePath, 'utf-8')) as Record<string, CandidatePatch | StoredRule>
+      for (const [pattern, value] of Object.entries(raw)) {
+        // Loads BOTH the new { patch, confidence, lastUsedAt } shape and a
+        // pre-Phase-13.1 store's bare CandidatePatch, so an existing
+        // production rule-store.json keeps working unmodified.
+        this.store.set(pattern, isStoredRule(value) ? value : { patch: value, confidence: 1, lastUsedAt: this.accessCounter++ })
       }
     }
   }
@@ -271,18 +305,56 @@ export class MetaKernelCompiler {
     return this.store.size
   }
 
-  recordFix(failurePattern: string, successfulFix: CandidatePatch): void {
-    this.store.set(failurePattern, successfulFix)
-    if (this.storePath) {
-      const dir = path.dirname(this.storePath)
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-      writeFileSync(this.storePath, JSON.stringify(Object.fromEntries(this.store), null, 2))
+  /** Total rules evicted over this instance's lifetime, for observability/testing. */
+  get evictedCount(): number {
+    return this.evictedRuleCount
+  }
+
+  private evictIfOverCapacity(): void {
+    while (this.store.size > this.maxRules) {
+      let worstKey: string | null = null
+      let worstRule: StoredRule | null = null
+      for (const [key, rule] of this.store) {
+        if (!worstRule || rule.confidence < worstRule.confidence || (rule.confidence === worstRule.confidence && rule.lastUsedAt < worstRule.lastUsedAt)) {
+          worstKey = key
+          worstRule = rule
+        }
+      }
+      if (worstKey === null) break
+      this.store.delete(worstKey)
+      this.evictedRuleCount++
     }
   }
 
+  private persist(): void {
+    if (!this.storePath) return
+    const dir = path.dirname(this.storePath)
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+    writeFileSync(this.storePath, JSON.stringify(Object.fromEntries(this.store), null, 2))
+  }
+
+  recordFix(failurePattern: string, successfulFix: CandidatePatch): void {
+    const existing = this.store.get(failurePattern)
+    this.store.set(failurePattern, {
+      patch: successfulFix,
+      confidence: existing ? existing.confidence + 1 : 1,
+      lastUsedAt: this.accessCounter++,
+    })
+    this.evictIfOverCapacity()
+    this.persist()
+  }
+
   tryMatchRule(failurePattern: string, context: MatchContext): string | null {
-    const patch = this.store.get(failurePattern)
-    if (!patch) return null
-    return applyPatch(patch, context)
+    const rule = this.store.get(failurePattern)
+    if (!rule) return null
+    const fixed = applyPatch(rule.patch, context)
+    if (fixed !== null) {
+      // A genuine hit: this rule generalized correctly to a NEW failure -
+      // real evidence it's worth keeping, so both its confidence and
+      // recency improve.
+      rule.confidence += 1
+      rule.lastUsedAt = this.accessCounter++
+    }
+    return fixed
   }
 }

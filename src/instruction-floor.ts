@@ -1,6 +1,7 @@
 import { X86Register, registerMap, parseInstruction, JCC_CONDITIONS } from '../lib/translator'
 import { getZ3, checkPushEquivalence, checkPopEquivalence, checkMemoryEquivalence } from './FloorEngine'
 import { type VerificationFloor, type GateOutcome, runVerificationFloor } from './verification-floor'
+import { withSolverDeadline, SOLVER_DEADLINE_DIAGNOSTIC, DEFAULT_SOLVER_DEADLINE_MS } from './layer1/verification-floors'
 
 // The ARM64 instruction-translation VerificationFloor - extracted from
 // CeilingAgent.ts (Phase 9) into its own leaf module, matching the pattern
@@ -70,7 +71,7 @@ function checkRegisterTokenValidity(candidate: string): GateOutcome<'fuzz'> {
   return { gate: 'fuzz', ok: true, details: `all ${tokens.length} register token(s) are valid ARM64 registers` }
 }
 
-async function checkSymbolicEquivalence(x86Instruction: string, candidate: string): Promise<GateOutcome<'symbolic'>> {
+async function checkSymbolicEquivalence(x86Instruction: string, candidate: string, solverDeadlineMs: number = DEFAULT_SOLVER_DEADLINE_MS): Promise<GateOutcome<'symbolic'>> {
   const parsedX86 = parseInstruction(x86Instruction)
   if (!parsedX86) {
     return { gate: 'symbolic', ok: false, details: `cannot verify "${x86Instruction}": could not parse instruction` }
@@ -204,7 +205,15 @@ async function checkSymbolicEquivalence(x86Instruction: string, candidate: strin
 
   const solver = new Solver()
   solver.add(x86Post.neq(armPost))
-  const result = await solver.check()
+
+  // Phase 13.2: a genuine Promise.race deadline - solver.check() is real
+  // async z3-solver WASM work, so racing it against a timer actually stops
+  // this caller from waiting indefinitely on a pathological query.
+  const deadlineOutcome = await withSolverDeadline(() => solver.check(), solverDeadlineMs)
+  if (!deadlineOutcome.ok) {
+    return { gate: 'symbolic', ok: false, details: SOLVER_DEADLINE_DIAGNOSTIC }
+  }
+  const result = deadlineOutcome.value
 
   if (result === 'unsat') {
     return {
@@ -268,6 +277,8 @@ function checkStaticShape(candidate: string): GateOutcome<'static'> {
 export interface Arm64InstructionCandidate {
   x86Instruction: string
   candidate: string
+  /** Phase 13.2: overrides the default 500ms Z3 deadline (see layer1/verification-floors.ts). */
+  solverDeadlineMs?: number
 }
 
 export type Arm64GateName = 'static' | 'fuzz' | 'symbolic'
@@ -277,14 +288,19 @@ export const ARM64_INSTRUCTION_FLOOR: VerificationFloor<Arm64InstructionCandidat
   gates: [
     { name: 'static', check: ({ candidate }) => checkStaticShape(candidate) },
     { name: 'fuzz', check: ({ candidate }) => checkRegisterTokenValidity(candidate) },
-    { name: 'symbolic', check: ({ x86Instruction, candidate }) => checkSymbolicEquivalence(x86Instruction, candidate) },
+    { name: 'symbolic', check: ({ x86Instruction, candidate, solverDeadlineMs }) => checkSymbolicEquivalence(x86Instruction, candidate, solverDeadlineMs) },
   ],
 }
 
-export async function verifyInstructionCandidate(x86Instruction: string, candidate: string): Promise<GateOutcome<Arm64GateName>[]> {
+export async function verifyInstructionCandidate(
+  x86Instruction: string,
+  candidate: string,
+  onGateComplete?: (gate: GateOutcome<Arm64GateName>, elapsedMs: number) => void,
+  solverDeadlineMs?: number
+): Promise<GateOutcome<Arm64GateName>[]> {
   // Register names and opcodes are case-insensitive in real ARM64 assembly;
   // normalized once here (see Phase 3.1) so every gate in the floor sees
   // consistent-case text, without mutating what's returned to the caller.
-  const report = await runVerificationFloor(ARM64_INSTRUCTION_FLOOR, { x86Instruction, candidate: candidate.toUpperCase() })
+  const report = await runVerificationFloor(ARM64_INSTRUCTION_FLOOR, { x86Instruction, candidate: candidate.toUpperCase(), solverDeadlineMs }, onGateComplete)
   return report.gates
 }

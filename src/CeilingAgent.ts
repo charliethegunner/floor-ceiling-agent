@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { Project, SyntaxKind } from 'ts-morph'
 import { type VerificationFloor, runVerificationFloor } from './verification-floor'
 import { TOPOLOGY_FLOOR, type TopologyCandidate } from './topology-floor'
@@ -8,6 +9,8 @@ import { ParallelCandidateSampler } from './layer3/sampler'
 import type { TemperatureStrategy, WorkerOffload } from './layer3/types'
 import type { WorkerPoolEvaluator, WorkerDomain } from './layer1/worker-pool'
 import { MetaKernelCompiler, classifyFailurePattern, derivePatch } from './layer5/meta-kernel'
+import type { EngineTracer } from './telemetry/tracer'
+import { formatEngineResponse, type FormattedEngineResponse, type ResolvedLayer } from './telemetry/output-formatter'
 
 export { verifyInstructionCandidate } from './instruction-floor'
 
@@ -94,12 +97,17 @@ export interface CeilingSuccess {
   gates: GateCheckResult[]
   /** Attempts rejected before the successful one, in order. Empty on a first-try success. */
   history: CeilingAttempt[]
+  /** Phase 11.4: only present when options.formatResponse is set - a purely
+   *  additive presentation layer, never required by existing callers. */
+  formatted?: FormattedEngineResponse
 }
 
 export interface CeilingFailureReport {
   request: CeilingRequest
   attempts: number
   history: CeilingAttempt[]
+  /** Phase 11.4: only present when options.formatResponse is set. */
+  formatted?: FormattedEngineResponse
 }
 
 export class CeilingAgentExhaustedError extends Error {
@@ -194,30 +202,35 @@ function stripJsonFences(candidateText: string): string {
   return match ? match[1].trim() : trimmed
 }
 
-export async function verifyTopologyCandidate(candidateText: string): Promise<GateCheckResult[]> {
+/** Called after each individual gate resolves, with its outcome and real
+ *  measured latency - Phase 11.1's EngineTracer wiring uses this to record
+ *  genuine per-gate spans, but any caller can pass one. */
+export type GateCompleteHook = (gate: GateCheckResult, elapsedMs: number) => void
+
+export async function verifyTopologyCandidate(candidateText: string, onGateComplete?: GateCompleteHook): Promise<GateCheckResult[]> {
   try {
     const parsed = JSON.parse(stripJsonFences(candidateText)) as TopologyCandidate
-    const report = await runVerificationFloor(TOPOLOGY_FLOOR, parsed)
+    const report = await runVerificationFloor(TOPOLOGY_FLOOR, parsed, onGateComplete)
     return report.gates
   } catch (error) {
     return [{ gate: TOPOLOGY_FLOOR.gates[0].name, ok: false, details: `candidate could not be verified: ${error instanceof Error ? error.message : String(error)}` }]
   }
 }
 
-export async function verifyClaimCandidate(candidateText: string): Promise<GateCheckResult[]> {
+export async function verifyClaimCandidate(candidateText: string, onGateComplete?: GateCompleteHook): Promise<GateCheckResult[]> {
   try {
     const parsed = JSON.parse(stripJsonFences(candidateText)) as ClaimCandidate
-    const report = await runVerificationFloor(CLAIM_VERIFICATION_FLOOR, parsed)
+    const report = await runVerificationFloor(CLAIM_VERIFICATION_FLOOR, parsed, onGateComplete)
     return report.gates
   } catch (error) {
     return [{ gate: CLAIM_VERIFICATION_FLOOR.gates[0].name, ok: false, details: `candidate could not be verified: ${error instanceof Error ? error.message : String(error)}` }]
   }
 }
 
-export async function verifySpatialCandidate(candidateText: string): Promise<GateCheckResult[]> {
+export async function verifySpatialCandidate(candidateText: string, onGateComplete?: GateCompleteHook): Promise<GateCheckResult[]> {
   try {
     const parsed = JSON.parse(stripJsonFences(candidateText)) as SpatialCandidate
-    const report = await runVerificationFloor(SPATIAL_VERIFICATION_FLOOR, parsed)
+    const report = await runVerificationFloor(SPATIAL_VERIFICATION_FLOOR, parsed, onGateComplete)
     return report.gates
   } catch (error) {
     return [{ gate: SPATIAL_VERIFICATION_FLOOR.gates[0].name, ok: false, details: `candidate could not be verified: ${error instanceof Error ? error.message : String(error)}` }]
@@ -291,12 +304,15 @@ const PROMPT_HEADERS: Record<CeilingRequestKind, (description: string) => string
 // verifier for its VerificationFloor, so runCeilingAgent's retry loop stays
 // domain-agnostic - adding a new floor means adding one entry here, not a
 // new branch in the loop itself.
-const VERIFIERS: Record<CeilingRequestKind, (request: CeilingRequest, candidate: string) => Promise<GateCheckResult[]> | GateCheckResult[]> = {
-  instruction: (request, candidate) => verifyInstructionCandidate(request.description, candidate),
+const VERIFIERS: Record<
+  CeilingRequestKind,
+  (request: CeilingRequest, candidate: string, onGateComplete?: GateCompleteHook) => Promise<GateCheckResult[]> | GateCheckResult[]
+> = {
+  instruction: (request, candidate, onGateComplete) => verifyInstructionCandidate(request.description, candidate, onGateComplete),
   patch: (_request, candidate) => verifyPatchCandidate(candidate),
-  topology: (_request, candidate) => verifyTopologyCandidate(candidate),
-  claim: (_request, candidate) => verifyClaimCandidate(candidate),
-  spatial: (_request, candidate) => verifySpatialCandidate(candidate),
+  topology: (_request, candidate, onGateComplete) => verifyTopologyCandidate(candidate, onGateComplete),
+  claim: (_request, candidate, onGateComplete) => verifyClaimCandidate(candidate, onGateComplete),
+  spatial: (_request, candidate, onGateComplete) => verifySpatialCandidate(candidate, onGateComplete),
 }
 
 // ---------------------------------------------------------------------------
@@ -360,10 +376,11 @@ const WORKER_DOMAIN_BY_KIND: Partial<Record<CeilingRequestKind, WorkerDomain>> =
 async function runSingleCandidateRound(
   request: CeilingRequest,
   llm: LlmClient,
-  history: CeilingAttempt[]
+  history: CeilingAttempt[],
+  onGateComplete?: GateCompleteHook
 ): Promise<{ candidate: string; gates: GateCheckResult[] }> {
   const candidate = await llm.complete(buildPrompt(request, history))
-  const gates = await VERIFIERS[request.kind](request, candidate)
+  const gates = await VERIFIERS[request.kind](request, candidate, onGateComplete)
   return { candidate, gates }
 }
 
@@ -371,7 +388,8 @@ async function runBestOfNRound(
   request: CeilingRequest,
   llm: LlmClient,
   history: CeilingAttempt[],
-  bestOfN: BestOfNOptions
+  bestOfN: BestOfNOptions,
+  tracer?: EngineTracer
 ): Promise<{ candidate: string; gates: GateCheckResult[] }> {
   const gatesByCandidate = new Map<string, GateCheckResult[]>()
 
@@ -421,7 +439,8 @@ async function runBestOfNRound(
       temperatureStrategy: bestOfN.temperatureStrategy ?? 'stepped',
       earlyExitOnSuccess: true,
     },
-    workerOffload
+    workerOffload,
+    tracer
   )
 
   const prompt = buildPrompt(request, history)
@@ -453,35 +472,60 @@ async function runBestOfNRound(
 async function tryMetaKernelBypass(
   request: CeilingRequest,
   history: CeilingAttempt[],
-  metaKernel: MetaKernelCompiler
+  metaKernel: MetaKernelCompiler,
+  tracer?: EngineTracer
 ): Promise<{ candidate: string; gates: GateCheckResult[] } | null> {
   if (history.length === 0) return null
 
   const lastFailure = history[history.length - 1]
   const pattern = classifyFailurePattern(request.kind, lastFailure.failedGate, lastFailure.candidate)
   const patched = metaKernel.tryMatchRule(pattern, { failingCandidate: lastFailure.candidate, failedGate: lastFailure.failedGate })
+  // "hit" means a compiled rule was found for this pattern - independent of
+  // whether the resulting candidate goes on to actually pass verification
+  // below, which is tracked separately via the gate spans that follow.
+  tracer?.recordMetaKernelCheck(patched !== null, patched !== null ? pattern : undefined)
   if (patched === null) return null
 
-  const gates = await VERIFIERS[request.kind](request, patched)
+  const onGateComplete: GateCompleteHook | undefined = tracer
+    ? (gate, elapsedMs) => tracer.recordFloorGate(gate.gate, gate.ok, elapsedMs, gate.ok ? undefined : gate.details)
+    : undefined
+  const gates = await VERIFIERS[request.kind](request, patched, onGateComplete)
   return gates.some((g) => !g.ok) ? null : { candidate: patched, gates }
 }
 
 export async function runCeilingAgent(
   request: CeilingRequest,
   llm: LlmClient,
-  options: { maxRetries?: number; bestOfN?: BestOfNOptions; metaKernel?: MetaKernelCompiler } = {}
+  options: {
+    maxRetries?: number
+    bestOfN?: BestOfNOptions
+    metaKernel?: MetaKernelCompiler
+    tracer?: EngineTracer
+    /** Phase 11.4: attach a CLI/JSON/Markdown-renderable FormattedEngineResponse
+     *  (src/telemetry/output-formatter.ts) to the result as `formatted`. Off by
+     *  default - every existing caller's CeilingSuccess/CeilingAgentExhaustedError
+     *  shape is unchanged. */
+    formatResponse?: boolean
+  } = {}
 ): Promise<CeilingSuccess> {
   const maxRetries = options.maxRetries ?? MAX_RETRIES_DEFAULT
   const history: CeilingAttempt[] = []
 
+  if (options.tracer) {
+    options.tracer.startTrace(randomUUID(), request.kind)
+  }
+  const onGateComplete: GateCompleteHook | undefined = options.tracer
+    ? (gate, elapsedMs) => options.tracer!.recordFloorGate(gate.gate, gate.ok, elapsedMs, gate.ok ? undefined : gate.details)
+    : undefined
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const bypass = options.metaKernel ? await tryMetaKernelBypass(request, history, options.metaKernel) : null
+    const bypass = options.metaKernel ? await tryMetaKernelBypass(request, history, options.metaKernel, options.tracer) : null
 
     const { candidate, gates } = bypass
       ? bypass
       : options.bestOfN
-        ? await runBestOfNRound(request, llm, history, options.bestOfN)
-        : await runSingleCandidateRound(request, llm, history)
+        ? await runBestOfNRound(request, llm, history, options.bestOfN, options.tracer)
+        : await runSingleCandidateRound(request, llm, history, onGateComplete)
 
     const failedGate = gates.find((g) => !g.ok)
     if (!failedGate) {
@@ -490,10 +534,28 @@ export async function runCeilingAgent(
         const pattern = classifyFailurePattern(request.kind, lastFailure.failedGate, lastFailure.candidate)
         options.metaKernel.recordFix(pattern, derivePatch(pattern, lastFailure.candidate, candidate))
       }
-      return { ok: true, result: candidate, attempts: attempt, gates, history: [...history] }
+      const success: CeilingSuccess = { ok: true, result: candidate, attempts: attempt, gates, history: [...history] }
+      if (options.formatResponse) {
+        // Ground-truth resolvedLayer from this loop's own control flow -
+        // never inferred from the trace after the fact (see
+        // output-formatter.ts's header comment for why that's ambiguous).
+        const resolvedLayer: ResolvedLayer = bypass
+          ? 'layer5-meta-kernel'
+          : options.bestOfN
+            ? 'layer3-sampler'
+            : attempt > 1
+              ? 'layer4-healing'
+              : 'layer1-floor'
+        success.formatted = formatEngineResponse({ ok: true, success, resolvedLayer }, options.tracer)
+      }
+      return success
     }
     history.push({ attempt, candidate, failedGate })
   }
 
-  throw new CeilingAgentExhaustedError({ request, attempts: maxRetries, history })
+  const failure: CeilingFailureReport = { request, attempts: maxRetries, history }
+  if (options.formatResponse) {
+    failure.formatted = formatEngineResponse({ ok: false, failure }, options.tracer)
+  }
+  throw new CeilingAgentExhaustedError(failure)
 }
