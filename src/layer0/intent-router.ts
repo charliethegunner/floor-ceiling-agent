@@ -72,7 +72,8 @@ export type IntentClassification =
 // just contain an opcode-shaped substring.
 // ---------------------------------------------------------------------------
 
-const INSTRUCTION_LINE_PATTERN = /^(MOV|ADD|SUB|AND|OR|XOR|SHL|SHR|CMP|PUSH|POP|CALL|JE|JNE|JG|JL|JGE|JLE)\s+[A-Za-z0-9[\],\s+*-]+$/i
+const INSTRUCTION_OPCODE_ALTERNATION = 'MOV|ADD|SUB|AND|OR|XOR|SHL|SHR|CMP|PUSH|POP|CALL|JE|JNE|JG|JL|JGE|JLE'
+const INSTRUCTION_LINE_PATTERN = new RegExp(`^(${INSTRUCTION_OPCODE_ALTERNATION})\\s+[A-Za-z0-9[\\],\\s+*-]+$`, 'i')
 const X86_REGISTER_PATTERN = /\b(RAX|RBX|RCX|RDX|RSP|RBP|RDI)\b/i
 
 const HEURISTIC_PATTERNS: Record<CeilingRequestKind, RegExp[]> = {
@@ -100,6 +101,47 @@ export function computeHeuristicSignal(rawText: string): HeuristicSignal {
   const winner = scores[top] > 0 && scores[top] > scores[runnerUp] ? top : null
 
   return { winner, scores }
+}
+
+// ---------------------------------------------------------------------------
+// Bare-instruction extraction (fixes a real gap a live orchestration
+// benchmark surfaced): CeilingRequest.description for kind 'instruction' is
+// defined as "the x86 instruction text to translate" - a bare line like
+// "ADD RAX, RBX" - but the LLM classification call is only asked to
+// "rewrite as a clear, self-contained description," and a real local model
+// doesn't reliably reduce a full sentence ("Translate the x86-64
+// instruction ADD RAX, RBX into its ARM64 equivalent.") down to that bare
+// form. Left as-is, instruction-floor.ts's parseInstruction takes the
+// FIRST WORD as the opcode unconditionally - it found "TRANSLATE", which
+// has no modeled semantics, so the Z3 symbolic gate reported "skipped, not
+// a failure" rather than genuinely proving anything. The fix belongs here,
+// not in instruction-floor.ts: that parser is a narrow, precise, heavily-
+// tested oracle used by every existing 'instruction' call site, and
+// loosening it to guess at embedded instructions would contaminate it with
+// exactly the fuzzy substring-scraping this project has avoided everywhere
+// else (the same reason INSTRUCTION_LINE_PATTERN above is anchored, not a
+// bare keyword search).
+//
+// Extraction re-uses the SAME opcode alternation as the heuristic pattern
+// (single source, no duplicated/drifting opcode list) and the real operand
+// grammar lib/translator.ts's own resolveOperand accepts (a register name,
+// a signed integer, or a bracketed memory/SIB expression) - not "any
+// letters," which would happily swallow trailing prose ("ADD RAX, RBX
+// into its ARM64 equivalent" is all letters and spaces). Only an
+// UNAMBIGUOUS single match is trusted; zero or multiple matches return
+// null so the caller can fail closed rather than guess which one was
+// meant.
+// ---------------------------------------------------------------------------
+
+const OPERAND_TOKEN = '(?:RAX|RBX|RCX|RDX|RSP|RBP|RDI|-?\\d+|\\[[^\\]]*\\])'
+const BARE_INSTRUCTION_EXTRACT_PATTERN = new RegExp(
+  `\\b(?:${INSTRUCTION_OPCODE_ALTERNATION})\\s+${OPERAND_TOKEN}(?:\\s*,\\s*${OPERAND_TOKEN})*`,
+  'gi'
+)
+
+export function extractBareInstruction(rawText: string): string | null {
+  const matches = [...rawText.matchAll(BARE_INSTRUCTION_EXTRACT_PATTERN)]
+  return matches.length === 1 ? matches[0][0].trim() : null
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +246,21 @@ export async function classifyIntent(rawText: string, llm: LlmClient, options: I
   const signalsAgree = heuristic.winner === null ? llmSignal.confidence === 'high' : heuristic.winner === llmSignal.kind
   if (!signalsAgree) {
     return buildAmbiguousResult(heuristic, llmSignal, rawText)
+  }
+
+  if (llmSignal.kind === 'instruction') {
+    const bareInstruction = extractBareInstruction(rawText)
+    if (!bareInstruction) {
+      return {
+        ok: false,
+        reason: 'ambiguous',
+        clarifyingQuestion:
+          `This looks like an instruction-translation request, but I couldn't unambiguously extract a single bare x86 instruction ` +
+          `(e.g. "ADD RAX, RBX") from it. Please provide just the instruction line. Original request: "${rawText}"`,
+        candidates: ['instruction'],
+      }
+    }
+    return gateOnAutonomy({ kind: 'instruction', description: bareInstruction }, options)
   }
 
   return gateOnAutonomy({ kind: llmSignal.kind, description: llmSignal.description }, options)

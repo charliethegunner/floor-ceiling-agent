@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'vitest'
-import { classifyIntent, computeHeuristicSignal, type IntentRouterOptions } from './intent-router'
+import { classifyIntent, computeHeuristicSignal, extractBareInstruction, type IntentRouterOptions } from './intent-router'
 import type { LlmClient } from '../CeilingAgent'
 
 class ScriptedLlmClient implements LlmClient {
@@ -74,6 +74,50 @@ describe('computeHeuristicSignal: pure pattern scoring, no LLM involved', () => 
 })
 
 // ---------------------------------------------------------------------------
+// extractBareInstruction: pure, LLM-free, tested in isolation - fixes a
+// real gap a live orchestration benchmark surfaced (see this function's
+// own header comment in intent-router.ts).
+// ---------------------------------------------------------------------------
+
+describe('extractBareInstruction: pure extraction, no LLM involved', () => {
+  test('an already-bare instruction extracts unchanged', () => {
+    expect(extractBareInstruction('MOV RAX, RBX')).toBe('MOV RAX, RBX')
+  })
+
+  test('a bare instruction embedded in a full sentence is extracted, trailing prose dropped - the exact regression a live benchmark caught', () => {
+    expect(extractBareInstruction('Translate the x86-64 instruction ADD RAX, RBX into its ARM64 equivalent.')).toBe('ADD RAX, RBX')
+  })
+
+  test('leading prose before the instruction is dropped too', () => {
+    expect(extractBareInstruction('Please convert this: CMP RCX, RDX')).toBe('CMP RCX, RDX')
+  })
+
+  test('a memory operand extracts correctly, without swallowing trailing prose', () => {
+    expect(extractBareInstruction('The instruction SUB RAX, [RBX+8] needs translating please')).toBe('SUB RAX, [RBX+8]')
+  })
+
+  test('an immediate operand extracts correctly', () => {
+    expect(extractBareInstruction('translate ADD RAX, 5 for me')).toBe('ADD RAX, 5')
+  })
+
+  test('a single-operand instruction (PUSH) extracts correctly', () => {
+    expect(extractBareInstruction('please translate PUSH RAX now')).toBe('PUSH RAX')
+  })
+
+  test('no instruction-shaped substring anywhere returns null, never a guess', () => {
+    expect(extractBareInstruction('Translate this instruction into ARM64 for me please')).toBeNull()
+  })
+
+  test('two DIFFERENT instruction-shaped substrings is a genuine ambiguity, not resolved by picking the first', () => {
+    expect(extractBareInstruction('Translate ADD RAX, RBX and also MOV RCX, RDX')).toBeNull()
+  })
+
+  test('ordinary prose containing common-word "opcodes" (CALL, OR, AND) without real operands never false-positives', () => {
+    expect(extractBareInstruction('You can call the function and or return a value')).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // classifyIntent: agreement, disagreement, and honest failure to classify.
 // ---------------------------------------------------------------------------
 
@@ -108,6 +152,46 @@ describe('classifyIntent: two-signal agreement classifies correctly', () => {
     const result = await classifyIntent('a module that exports and imports, checking reachability', llm)
     expect(result.ok).toBe(true)
     expect(result.ok && result.request.kind).toBe('topology')
+  })
+})
+
+describe('classifyIntent: instruction descriptions are always sanitized to bare instruction text, never trusted verbatim from the LLM', () => {
+  test('reproduces the exact live-benchmark regression: the LLM leaves the full sentence as its description, but the returned request carries the bare, extracted instruction instead', async () => {
+    const raw = 'Translate the x86-64 instruction ADD RAX, RBX into its ARM64 equivalent.'
+    // A real local model's actual (unhelpful) response, captured from a live run.
+    const llm = new ScriptedLlmClient(llmJson('instruction', raw, 'high'))
+    const result = await classifyIntent(raw, llm)
+
+    expect(result.ok).toBe(true)
+    expect(result.ok && result.request).toEqual({ kind: 'instruction', description: 'ADD RAX, RBX' })
+  })
+
+  test('when the LLM already returns a properly bare description, it is used as-is (extraction from raw text agrees)', async () => {
+    const llm = new ScriptedLlmClient(llmJson('instruction', 'MOV RAX, RBX', 'high'))
+    const result = await classifyIntent('MOV RAX, RBX', llm)
+    expect(result.ok && result.request).toEqual({ kind: 'instruction', description: 'MOV RAX, RBX' })
+  })
+
+  test('when no bare instruction can be unambiguously extracted from the raw text, classification fails closed as ambiguous rather than passing malformed description text downstream', async () => {
+    // Heuristic wins on the register mention alone even though there's no
+    // clean "OPCODE operand" shape anywhere in the sentence.
+    const raw = 'Please handle the RAX register somehow for this ADD operation'
+    const llm = new ScriptedLlmClient(llmJson('instruction', raw, 'high'))
+    const result = await classifyIntent(raw, llm)
+
+    expect(result.ok).toBe(false)
+    expect(result.ok === false && result.reason).toBe('ambiguous')
+    expect(result.ok === false && result.reason === 'ambiguous' && result.clarifyingQuestion).toContain("couldn't unambiguously extract")
+  })
+
+  test('a non-instruction kind is never run through bare-instruction extraction - its LLM-normalized description passes through unchanged', async () => {
+    const raw = 'Claim that translateInstruction should return the correct ARM64 form for ADD RAX, RBX - verify that this assertion holds'
+    const normalized = 'A claim that translateInstruction correctly translates ADD RAX, RBX.'
+    const llm = new ScriptedLlmClient(llmJson('claim', normalized, 'high'))
+    const result = await classifyIntent(raw, llm)
+
+    expect(result.ok).toBe(true)
+    expect(result.ok && result.request).toEqual({ kind: 'claim', description: normalized })
   })
 })
 
