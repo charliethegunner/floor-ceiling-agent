@@ -32,24 +32,51 @@ export interface OpenAiCompatibleClientOptions {
   baseUrl: string // e.g. 'http://localhost:11434/v1' (Ollama) or 'http://localhost:8000/v1' (vLLM)
   model: string
   apiKey?: string
+  /** Phase 16.1: a real, bounded wait for a local LLM server (Ollama/vLLM)
+   *  that's unreachable or has stopped responding - without this, a
+   *  connection-refused-slow-retry or a genuinely hung server left a call
+   *  (and anything awaiting it - a whole runCeilingAgent retry loop, a
+   *  whole test run) hanging indefinitely, with no way to distinguish
+   *  "still thinking" from "never coming back." 120s default: real local
+   *  CPU inference of a 7B-class model on a longer prompt genuinely took
+   *  up to ~10s in this project's own live runs - 120s gives real headroom
+   *  above that before treating the server as unresponsive. */
+  timeoutMs?: number
 }
+
+const DEFAULT_OLLAMA_TIMEOUT_MS = 120_000
 
 export class OpenAiCompatibleLlmClient implements LlmClient {
   constructor(private readonly options: OpenAiCompatibleClientOptions) {}
 
   async complete(prompt: string, temperature = 0): Promise<string> {
-    const response = await fetch(`${this.options.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(this.options.apiKey ? { Authorization: `Bearer ${this.options.apiKey}` } : {}),
-      },
-      body: JSON.stringify({
-        model: this.options.model,
-        messages: [{ role: 'user', content: prompt }],
-        temperature,
-      }),
-    })
+    const timeoutMs = this.options.timeoutMs ?? DEFAULT_OLLAMA_TIMEOUT_MS
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+
+    let response: Response
+    try {
+      response = await fetch(`${this.options.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(this.options.apiKey ? { Authorization: `Bearer ${this.options.apiKey}` } : {}),
+        },
+        body: JSON.stringify({
+          model: this.options.model,
+          messages: [{ role: 'user', content: prompt }],
+          temperature,
+        }),
+        signal: controller.signal,
+      })
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(`LLM endpoint ${this.options.baseUrl} did not respond within ${timeoutMs}ms - is the server running and reachable?`)
+      }
+      throw error
+    } finally {
+      clearTimeout(timer)
+    }
 
     if (!response.ok) {
       throw new Error(`LLM endpoint ${this.options.baseUrl} returned ${response.status}: ${await response.text()}`)

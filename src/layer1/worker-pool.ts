@@ -3,6 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { WorkerDomain, WorkerVerifyTask, WorkerGateOutcome } from './worker-pool-worker'
+import { registerForGracefulShutdown } from './process-lifecycle'
 
 export type { WorkerDomain, WorkerVerifyTask, WorkerGateOutcome }
 
@@ -110,12 +111,17 @@ export class WorkerPoolEvaluator {
   private nextSlotIndex = 0
   private closed = false
   private recycledWorkers = 0
+  private readonly unregisterFromGracefulShutdown: () => void
 
   constructor(options: WorkerPoolOptions = {}) {
     const poolSize = Math.max(1, options.poolSize ?? os.cpus().length - 1)
     this.taskTimeoutMs = options.taskTimeoutMs ?? DEFAULT_TASK_TIMEOUT_MS
     this.maxWorkerRssBytes = options.maxWorkerRssBytes ?? DEFAULT_MAX_WORKER_RSS_BYTES
     this.slots = Array.from({ length: poolSize }, () => this.spawnSlot())
+    // Phase 16.1: a real safety net for an interrupted run (Ctrl+C mid test
+    // suite, a killed CLI process) - see process-lifecycle.ts's header
+    // comment for why this is a single shared handler, not one per pool.
+    this.unregisterFromGracefulShutdown = registerForGracefulShutdown({ terminate: () => this.shutdown() })
   }
 
   /** Total workers proactively recycled for exceeding maxWorkerRssBytes, over this pool's lifetime. */
@@ -222,6 +228,7 @@ export class WorkerPoolEvaluator {
   async shutdown(): Promise<void> {
     if (this.closed) return
     this.closed = true
+    this.unregisterFromGracefulShutdown()
     await Promise.all(
       this.slots.map(async (slot) => {
         this.failAllPending(slot, new Error('worker pool shut down'))

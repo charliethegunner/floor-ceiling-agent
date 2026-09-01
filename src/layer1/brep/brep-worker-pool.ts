@@ -3,6 +3,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { WorkerGateOutcome } from '../worker-pool-worker'
 import type { BRepCandidate } from './brep-floor'
+import { registerForGracefulShutdown } from '../process-lifecycle'
 
 // Phase 15.0: dedicated worker-thread isolation for B-Rep verification,
 // following the SAME pool pattern WorkerPoolEvaluator (Phase 9/13.3)
@@ -77,12 +78,18 @@ export class BRepWorkerPoolEvaluator {
   private nextSlotIndex = 0
   private closed = false
   private recycledWorkers = 0
+  private readonly unregisterFromGracefulShutdown: () => void
 
   constructor(options: BRepWorkerPoolOptions = {}) {
     const poolSize = Math.max(1, options.poolSize ?? 1)
     this.taskTimeoutMs = options.taskTimeoutMs ?? DEFAULT_TASK_TIMEOUT_MS
     this.maxWorkerRssBytes = options.maxWorkerRssBytes ?? DEFAULT_MAX_WORKER_RSS_BYTES
     this.slots = Array.from({ length: poolSize }, () => this.spawnSlot())
+    // Phase 16.1: same real safety net as WorkerPoolEvaluator's - each
+    // worker here also carries a real ~450-500MB OpenCASCADE instance, so
+    // an interrupted run leaving one alive is a genuinely worse leak than
+    // the general pool's lighter workers.
+    this.unregisterFromGracefulShutdown = registerForGracefulShutdown({ terminate: () => this.shutdown() })
   }
 
   get recycledWorkerCount(): number {
@@ -187,6 +194,7 @@ export class BRepWorkerPoolEvaluator {
   async shutdown(): Promise<void> {
     if (this.closed) return
     this.closed = true
+    this.unregisterFromGracefulShutdown()
     await Promise.all(
       this.slots.map(async (slot) => {
         this.failAllPending(slot, new Error('worker pool shut down'))

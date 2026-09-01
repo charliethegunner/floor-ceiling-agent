@@ -10,6 +10,19 @@ import { X86Register, registerMap, parseInstruction, parseX86MemoryOperand } fro
 // memory under Node - so the (expensive) module init is memoized once per
 // process, while Context(name) - proven safe to call repeatedly with the
 // same name across many independent checks - stays fresh per check.
+//
+// Phase 16.1 process-hardening note: unlike WorkerPoolEvaluator/
+// BRepWorkerPoolEvaluator (real worker_threads, real OS resources that
+// must be explicitly terminated - see process-lifecycle.ts), Z3 here runs
+// entirely in-process, synchronously within whichever thread calls it -
+// no separate thread, socket, or file handle of its own. Its only
+// resource is this process's own WASM linear memory, which the OS
+// reclaims automatically on process exit like any other memory - there is
+// no separate handle for a SIGINT/SIGTERM hook to release, and adding one
+// would be a hook that does nothing real. This was verified, not assumed:
+// process.getActiveResourcesInfo() shows zero additional resources after
+// getZ3() resolves (see process-lifecycle.test.ts's own technique for
+// this exact check, applied here during this phase's investigation).
 let z3Module: ReturnType<typeof init> | undefined
 
 export function getZ3(): ReturnType<typeof init> {

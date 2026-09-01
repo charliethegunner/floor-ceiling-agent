@@ -1,4 +1,5 @@
 import { describe, expect, test, afterEach } from 'vitest'
+import { createServer } from 'node:http'
 import {
   runCeilingAgent,
   CeilingAgentExhaustedError,
@@ -328,6 +329,59 @@ describe('OpenAiCompatibleLlmClient', () => {
     } finally {
       globalThis.fetch = originalFetch
     }
+  })
+
+  // Phase 16.1: a real, bounded wait for a local LLM server that's stopped
+  // responding - genuine servers used, not a mocked fetch() promise that
+  // never resolves, so the real AbortController/signal wiring is what's
+  // actually exercised, not a simulation of it.
+  describe('connection timeout (Phase 16.1)', () => {
+    function neverRespondingServer(): Promise<{ server: ReturnType<typeof createServer>; port: number }> {
+      return new Promise((resolve) => {
+        const server = createServer(() => {
+          // deliberately never responds - simulates a hung/unreachable local server
+        })
+        server.listen(0, () => {
+          const address = server.address()
+          const port = typeof address === 'object' && address ? address.port : 0
+          resolve({ server, port })
+        })
+      })
+    }
+
+    test('an unresponsive server causes complete() to reject within the configured timeout, not hang indefinitely', async () => {
+      const { server, port } = await neverRespondingServer()
+      try {
+        const client = new OpenAiCompatibleLlmClient({ baseUrl: `http://127.0.0.1:${port}`, model: 'test', timeoutMs: 200 })
+        const start = Date.now()
+        await expect(client.complete('hello')).rejects.toThrow(/did not respond within 200ms/)
+        expect(Date.now() - start).toBeLessThan(2000)
+      } finally {
+        server.close()
+      }
+    })
+
+    test('a fast, healthy response completes normally even with a short timeout configured - the timeout never interferes with normal completion', async () => {
+      const originalFetch = globalThis.fetch
+      globalThis.fetch = (async () => new Response(JSON.stringify({ choices: [{ message: { content: 'fine' } }] }), { status: 200 })) as typeof fetch
+      try {
+        const client = new OpenAiCompatibleLlmClient({ baseUrl: 'http://localhost:11434/v1', model: 'qwen2.5-coder', timeoutMs: 500 })
+        await expect(client.complete('prompt')).resolves.toBe('fine')
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    test('timeoutMs is optional - omitting it uses the real default rather than throwing or requiring configuration', async () => {
+      const originalFetch = globalThis.fetch
+      globalThis.fetch = (async () => new Response(JSON.stringify({ choices: [{ message: { content: 'fine' } }] }), { status: 200 })) as typeof fetch
+      try {
+        const client = new OpenAiCompatibleLlmClient({ baseUrl: 'http://localhost:11434/v1', model: 'qwen2.5-coder' })
+        await expect(client.complete('prompt')).resolves.toBe('fine')
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
   })
 })
 
