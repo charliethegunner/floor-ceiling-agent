@@ -179,6 +179,17 @@ export class EngineTracer {
     })
   }
 
+  /** Real per-gate latencies recorded so far via recordFloorGate, for a
+   *  lightweight consumer (e.g. a /metrics endpoint) that wants the numbers
+   *  without re-parsing exportSpanJson's OTLP attribute-value union. */
+  getGateLatencies(): { gate: string; ok: boolean; elapsedMs: number }[] {
+    return this.gateSpans.map((span) => ({
+      gate: span.name.slice('floor_gate:'.length),
+      ok: span.status === 'OK',
+      elapsedMs: typeof span.attributes.latency_ms === 'number' ? span.attributes.latency_ms : 0,
+    }))
+  }
+
   private toOtlpSpan(span: InternalSpan): OtlpSpan {
     return {
       traceId: span.traceId,

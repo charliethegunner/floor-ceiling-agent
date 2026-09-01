@@ -153,6 +153,26 @@ describe('EngineTracer: recordFloorGate creates real child spans with computed d
   })
 })
 
+describe('EngineTracer: getGateLatencies exposes real per-gate latency without re-parsing exportSpanJson', () => {
+  test('returns one entry per recordFloorGate call, in order, with the real gate/ok/elapsedMs values', () => {
+    const tracer = new EngineTracer()
+    tracer.startTrace('req-1', 'instruction')
+    tracer.recordFloorGate('static', true, 3)
+    tracer.recordFloorGate('symbolic', false, 15, 'counterexample found')
+
+    expect(tracer.getGateLatencies()).toEqual([
+      { gate: 'static', ok: true, elapsedMs: 3 },
+      { gate: 'symbolic', ok: false, elapsedMs: 15 },
+    ])
+  })
+
+  test('with no gates recorded, returns an empty array', () => {
+    const tracer = new EngineTracer()
+    tracer.startTrace('req-1', 'instruction')
+    expect(tracer.getGateLatencies()).toEqual([])
+  })
+})
+
 describe('EngineTracer: exportSpanJson produces a well-formed OTLP-shaped trace export', () => {
   test('the top-level shape matches OTLP JSON: resourceSpans[].scopeSpans[].spans[]', () => {
     const tracer = new EngineTracer()

@@ -7,7 +7,8 @@
     "benchmark": "tsx scripts/benchmark-live.ts",
     "benchmark:sampler": "tsx scripts/benchmark-sampler.ts",
     "loadtest": "tsx scripts/load-test-engine.ts",
-    "translate": "tsx bin/translate.ts"
+    "translate": "tsx bin/translate.ts",
+    "server": "tsx src/server/index.ts"
   },
   "devDependencies": {
     "@grpc/grpc-js": "^1.14.4",

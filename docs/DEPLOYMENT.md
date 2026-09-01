@@ -1,39 +1,46 @@
 # Deployment & Production Readiness Guide
 
-Phase 23.0. This document defines operational SLAs, containerization patterns,
-process/WASM memory limits, and monitoring controls for running the "System 2"
-LLM-verified multi-domain engine (`CeilingAgent`, the five verification floors,
+Phase 23.0, extended by Phase 24.0. This document defines operational SLAs,
+containerization patterns, process/WASM memory limits, and monitoring
+controls for running the "System 2" LLM-verified multi-domain engine
+(`CeilingAgent`, the five verification floors,
 `WorkerPoolEvaluator`/`BRepWorkerPoolEvaluator`, `EngineTracer`) described in
-`ARCHITECTURE.md` §7 onward, in a production environment. Every value below is
-taken from the real defaults in `src/` on `main` (`f9b92a6`) — see the
-**Source-of-truth appendix** for exact file/line references. Nothing here is
-gated in CI; treat a stale number in this file as a bug, same as
-`ARCHITECTURE.md`.
+`ARCHITECTURE.md` §7 onward, and the HTTP runtime wrapper that now exposes it
+(`src/server/`, Phase 24.0), in a production environment. Every value below is
+taken from the real defaults in `src/` on `main` — see the **Source-of-truth
+appendix** for exact file/line references. Nothing here is gated in CI; treat
+a stale number in this file as a bug, same as `ARCHITECTURE.md`.
 
 ## 0. What this system actually is (read before the rest of this doc)
 
-This project ships **no HTTP server, no `/healthz` route, no Dockerfile, and
-no Kubernetes manifest** as of `f9b92a6`. It is a Node/TypeScript library plus
-a CLI (`bin/translate.ts`, run via `npm run translate`) invoked programmatically
-via `runCeilingAgent` / `TaskGraphExecutor`. There is no build step — every
-entrypoint (`bin/translate.ts`, `scripts/*.ts`, the worker-thread scripts
-themselves) runs directly under `tsx` (`package.json`'s `scripts` block; CI
-runs `npx tsc --noEmit` only for type-checking, never `tsc` to emit `.js`).
+As of Phase 24.0, this project ships a real, lightweight HTTP entrypoint —
+`src/server/index.ts` (`createServer`), run via `npm run server` — that wraps
+`runCeilingAgent`, `WorkerPoolEvaluator`, and `BRepWorkerPoolEvaluator` behind
+`/healthz`, `/live`, `/ready`, `/verify`, and `/metrics` (§2.4, §3). It is
+still a plain `node:http` server with **no framework dependency**, and this
+repository still ships **no Dockerfile and no Kubernetes manifest** — §1.4's
+container guidance remains recommended operator wiring, not in-repo code.
+There is still no build step — every entrypoint (`bin/translate.ts`,
+`src/server/index.ts`, `scripts/*.ts`, the worker-thread scripts themselves)
+runs directly under `tsx` (`package.json`'s `scripts` block; CI runs `npx tsc
+--noEmit` only for type-checking, never `tsc` to emit `.js`).
 
 Sections 1-3 below therefore split into two kinds of guidance:
 
-- **Real, documented behavior** — the engine's actual configuration surface
-  (constructor options, exported constants), its actual memory/timeout
-  defaults, its actual shutdown and telemetry behavior. Cited to file/line.
-- **Recommended operator wiring** — how to containerize this and expose
-  environment variables, health probes, and container resource limits *around*
-  it, since none of that exists in-repo today. Marked explicitly as
-  recommendation, not existing code, so this document can't be mistaken for a
-  description of a deployment pipeline that doesn't exist yet.
+- **Real, documented behavior** — the engine's and the HTTP wrapper's actual
+  configuration surface (constructor options, exported constants, parsed
+  environment variables), their actual memory/timeout defaults, and their
+  actual shutdown/telemetry/routing behavior. Cited to file/line.
+- **Recommended operator wiring** — how to containerize this deployment
+  (base image, resource limits, Kubernetes manifests), since none of that
+  exists in-repo today. Marked explicitly as recommendation, not existing
+  code, so this document can't be mistaken for a description of a deployment
+  pipeline that doesn't exist yet.
 
-Any team embedding this engine behind their own service process (an HTTP API,
-a queue worker, a batch job) should follow §2's env-var convention when
-building that wrapper, and implement §2.4's health-check pattern inside it.
+A team that needs behavior `src/server/` doesn't cover (a different protocol,
+auth, multi-tenancy) should still follow §2's real env-var names when
+extending it, and can reuse `createServer`'s dependency-injection shape
+(`ServerDependencies`) rather than re-wrapping `runCeilingAgent` from scratch.
 
 ## 1. Process Isolation & Resource Hardening
 
@@ -125,21 +132,22 @@ a team building one:
   specifically so the main thread keeps one core free (`worker-pool.ts:117`);
   under-provisioning CPU below that count defeats the reason that default
   exists.
-- **No exposed network port** unless your own wrapper adds an HTTP/gRPC
-  server around `runCeilingAgent`/`TaskGraphExecutor` — the engine itself
-  never binds a socket (the one exception, `src/layer1/distributed/`'s real
-  gRPC transport for `DistributedWorkerPoolEvaluator`, is opt-in and used only
-  when a caller constructs it explicitly).
+- **Expose one network port**: `src/server/index.ts` (Phase 24.0) binds
+  `PORT` (default `8080`, §2.2) via plain `node:http` — no gRPC port unless
+  you also construct a `DistributedWorkerPoolEvaluator`
+  (`src/layer1/distributed/`, opt-in, used only when a caller constructs it
+  explicitly).
 
 ## 2. Environment Configuration & Fail-Closed Safety
 
-### 2.1 Current state: no environment variables are read by the engine
+### 2.1 The core engine still reads no environment variables directly
 
-A repo-wide search for `process.env.*` in `src/`, `lib/`, and `bin/` returns
-zero hits relevant to Z3, thread pools, or retries. Every knob referenced in
-this section's title (Z3 timeout, thread pool size, `MAX_RETRIES_DEFAULT`) is
-a **TypeScript constructor option or exported constant**, not an environment
-variable, as of `f9b92a6`:
+A repo-wide search for `process.env.*` in `src/CeilingAgent.ts`,
+`src/layer1/*` (excluding `src/server/`), and `lib/` returns zero hits
+relevant to Z3, thread pools, or retries. Every knob referenced in this
+section's title (Z3 timeout, thread pool size, `MAX_RETRIES_DEFAULT`) is a
+**TypeScript constructor option or exported constant** at the engine layer,
+not an environment variable:
 
 | Setting | Real default | Where | Type |
 |---|---|---|---|
@@ -152,29 +160,40 @@ variable, as of `f9b92a6`:
 | Meta-kernel rule cap | `1000` | `src/layer5/meta-kernel.ts` (`maxRules`, per `ARCHITECTURE.md` §7.6) | `MetaKernelCompiler` option |
 | **Z3 solver timeout** | **none** | — | Z3 gates have no dedicated solver-level timeout anywhere in `src/`; a Z3 gate run through a worker pool is bounded only by that pool's `taskTimeoutMs` (30s default) — run in-process (no pool supplied), it is **unbounded** and relies entirely on Z3 itself terminating. Flag this as a real gap if you route `instruction`-domain traffic in-process without a worker pool. |
 
-### 2.2 Recommended `ENV_VAR` → option mapping (operator wiring, not existing code)
+### 2.2 Real `ENV_VAR` → option mapping (`src/server/config.ts`, Phase 24.0)
 
-If you build a wrapper entrypoint around this engine (§0), the following
-mapping is recommended so operators can tune it without a code change. This
-is a **convention for your entrypoint script to implement** — nothing in
-`src/CeilingAgent.ts` or `src/layer1/*` reads `process.env` today.
+`loadServerConfig(env)` (`src/server/config.ts`) parses these — the HTTP
+wrapper's `main()` (`src/server/index.ts`) passes the resolved fields
+straight into `OpenAiCompatibleLlmClient`/`WorkerPoolEvaluator`/
+`BRepWorkerPoolEvaluator`'s own constructor options:
 
-| Env var | Maps to | Suggested default |
+| Env var | Maps to | Unset behavior |
 |---|---|---|
-| `CEILING_MAX_RETRIES` | `runCeilingAgent(..., { maxRetries: Number(...) })` | `5` (matches `MAX_RETRIES_DEFAULT`) |
-| `WORKER_POOL_SIZE` | `new WorkerPoolEvaluator({ poolSize: Number(...) })` | unset → engine default (`os.cpus().length - 1`) |
-| `WORKER_TASK_TIMEOUT_MS` | `WorkerPoolOptions.taskTimeoutMs` | `30000` |
-| `WORKER_MAX_RSS_BYTES` | `WorkerPoolOptions.maxWorkerRssBytes` | `536870912` (512MB) |
-| `BREP_POOL_SIZE` | `BRepWorkerPoolOptions.poolSize` | `1` — do not raise without re-measuring host memory; each unit costs ~450-500MB RSS at rest |
-| `BREP_MAX_RSS_BYTES` | `BRepWorkerPoolOptions.maxWorkerRssBytes` | `943718400` (900MB) |
-| `LLM_BASE_URL` | `OpenAiCompatibleClientOptions.baseUrl` | required, no safe default (e.g. `http://localhost:11434/v1` for local Ollama) |
-| `LLM_TIMEOUT_MS` | `OpenAiCompatibleClientOptions.timeoutMs` | `120000` |
+| `MAX_RETRIES` | `runCeilingAgent(..., { maxRetries })` | `undefined` → engine default (`MAX_RETRIES_DEFAULT = 5`) |
+| `WORKER_POOL_SIZE` | `WorkerPoolOptions.poolSize` | `undefined` → engine default (`os.cpus().length - 1`) |
+| `BREP_WORKER_POOL_SIZE` | `BRepWorkerPoolOptions.poolSize` | `undefined` → engine default (`1`) — do not raise without re-measuring host memory; each unit costs ~450-500MB RSS at rest |
+| `WORKER_RSS_THRESHOLD_MB` (megabytes) | `WorkerPoolOptions.maxWorkerRssBytes` (bytes, `×1024×1024`) | `undefined` → engine default (512MB) |
+| `BREP_RSS_THRESHOLD_MB` (megabytes) | `BRepWorkerPoolOptions.maxWorkerRssBytes` (bytes) | `undefined` → engine default (900MB) |
+| `LLM_TIMEOUT_MS` | `OpenAiCompatibleClientOptions.timeoutMs` | `undefined` → engine default (`120000`) |
+| `LLM_BASE_URL` | `OpenAiCompatibleClientOptions.baseUrl` | **required** — `loadServerConfig` throws at startup if missing, no safe default (e.g. `http://localhost:11434/v1` for local Ollama) |
+| `LLM_MODEL` | `OpenAiCompatibleClientOptions.model` | **required** — throws if missing |
 | `LLM_API_KEY` | `OpenAiCompatibleClientOptions.apiKey` | unset for a local Ollama/vLLM endpoint with no auth |
+| `PORT` | the HTTP port `server.listen()` binds | defaults to `8080` |
 
-Validate and fail closed at process startup (not at first request) if a
-required var like `LLM_BASE_URL` is missing or a numeric var fails to parse —
-never silently fall back to an in-code default for a variable the operator
-explicitly set but got wrong.
+Deliberate design choice, not an oversight: every numeric field resolves to
+`undefined` (not a duplicated literal) when its env var is unset, so
+`options.x ?? DEFAULT` at each constructor is the *only* place that default
+number lives — `config.ts` can never drift out of sync with a default that
+changes inside `worker-pool.ts`/`brep-worker-pool.ts`/`CeilingAgent.ts` later.
+There is no `WORKER_TASK_TIMEOUT_MS`/`Z3_TIMEOUT_MS` — the 30s
+`taskTimeoutMs` and the absent Z3 solver timeout (§2.1's last row) are not
+exposed as env vars by this wrapper today.
+
+`loadServerConfig` validates and fails closed at process startup (not at
+first request): a missing `LLM_BASE_URL`/`LLM_MODEL`, or any numeric var that
+isn't a positive integer, throws immediately rather than silently falling
+back to an in-code default for a variable the operator explicitly set but
+got wrong.
 
 ### 2.3 Fail-open vs. fail-closed — read this before wiring alerts
 
@@ -201,33 +220,36 @@ misroute an incident:
   within a bounded window, the wrapper should report not-ready — that is a
   property of the surrounding service, not of `WorkerPoolLike.verify()`.
 
-### 2.4 Health check probes (recommended — no HTTP server exists in-repo)
+### 2.4 Health check probes (real routes, `src/server/index.ts`, Phase 24.0)
 
-Since this engine exposes no HTTP endpoint, `/healthz` and readiness/liveness
-probes are guidance for the wrapping service, built on real, inspectable
-engine state:
-
-- **Liveness** — the wrapper process is alive and its event loop is
-  responsive. A worker-thread pool doesn't block the main thread, so a
-  simple periodic timer-based heartbeat is sufficient; treat a missed
-  heartbeat beyond ~2× the check interval as a hung event loop.
-- **Readiness** — fail closed (return not-ready) if any of:
+- **`GET /healthz` (alias `GET /live`) — liveness.** Measures a real
+  `setImmediate` round-trip (`measureEventLoopLagMs`) rather than trusting
+  "this handler ran" — under moderate event-loop backup a handler can still
+  eventually execute, so the lag itself is the signal. Returns `200
+  { status: 'ok', eventLoopLagMs }` under `LIVENESS_MAX_EVENT_LOOP_LAG_MS`
+  (1000ms), else `503 { status: 'degraded', eventLoopLagMs }`.
+- **`GET /ready` — readiness.** Fails closed (`503`) if any of:
   - `pool.poolSize === 0` for either worker pool (construction failed or
     every slot died without respawning).
-  - A synthetic self-check candidate (a trivial known-good `instruction` or
-    `topology` candidate) fails to pass `verify()` within
-    `taskTimeoutMs + 5s` on a rolling schedule (e.g. every 30s) — this
-    exercises the real Z3/ts-morph/OpenCASCADE code paths, not just process
-    existence.
-  - `recycledWorkerCount` has increased more than N times (start at 5) in the
-    last 5 minutes — not itself fatal (§2.3), but sustained high recycling
-    indicates a task profile the current `maxWorkerRssBytes`/`poolSize`
-    combination can't sustain, and new work should stop routing here until
-    it's investigated.
-  - The configured `LLM_BASE_URL` endpoint fails a lightweight reachability
-    check — `runCeilingAgent` cannot make progress without it, and letting
-    traffic route to a replica that will only fail after a 120s LLM timeout
-    (§2.1) wastes the retry budget for no benefit.
+  - A synthetic self-check candidate — a known-good `spatial` sphere for
+    `WorkerPoolEvaluator`, a known-good `brep` box for
+    `BRepWorkerPoolEvaluator` — is round-tripped through the real
+    `pool.verify()`. Because `verify()` never rejects (§2.3's fail-open
+    contract), responsiveness is inferred from whether the caller-supplied
+    `fallback()` was actually invoked, not from a thrown error.
+  - `recycledWorkerCount` (the one real counter both pools expose — neither
+    has a direct RSS getter, per §1.1's process-wide-RSS caveat) has grown by
+    more than `READY_RECYCLE_THRESHOLD` (`5`) within the trailing
+    `READY_RECYCLE_WINDOW_MS` (5 minutes), tracked per pool by
+    `RecycleWindowTracker`. Not itself fatal on its own (§2.3), but sustained
+    growth is the closest available proxy for "the RSS limit is being
+    breached repeatedly."
+  - Response body reports both pools' `poolSize`/`responsive`/
+    `recycledWorkerCount`/`recentRecycles`/`rssLimitOk` for diagnosis.
+  - `LLM_BASE_URL` reachability is **not** checked by `/ready` today — it
+    only inspects worker-pool state, per its own name. A misconfigured or
+    unreachable LLM endpoint surfaces at `/verify` time instead (a 120s
+    `LLM_TIMEOUT_MS` timeout per request, §2.1), not at `/ready`.
 - **Startup probe**: allow at least the sum of both pools' cold-init cost —
   Z3 WASM (~200ms) + ts-morph project load, times `poolSize`, plus OpenCASCADE
   WASM (~600ms per B-Rep worker, `ARCHITECTURE.md` §7.5) — before the first
@@ -238,12 +260,16 @@ engine state:
 `src/layer1/process-lifecycle.ts` installs exactly one process-level
 `SIGINT`/`SIGTERM` handler (not one per pool, to avoid Node's max-listener
 warning and a multi-handler `process.exit()` race) that fans out to every
-currently-registered `WorkerPoolEvaluator`/`BRepWorkerPoolEvaluator` and calls
-`terminate()` on each, then exits `130` (SIGINT) or `143` (SIGTERM) — the
-conventional `128 + signal number` POSIX codes. This is real and already
-wired automatically by both pools' constructors — no additional operator
-configuration is required for clean pod termination beyond sizing
-`terminationGracePeriodSeconds` per §1.4.
+currently-registered `Terminable` and calls `terminate()` on each, then exits
+`130` (SIGINT) or `143` (SIGTERM) — the conventional `128 + signal number`
+POSIX codes. `WorkerPoolEvaluator`/`BRepWorkerPoolEvaluator` self-register in
+their own constructors; as of Phase 24.0, `src/server/index.ts`'s `main()`
+registers the `http.Server` itself the same way (`closeHttpServer` wrapped as
+a `Terminable`), so one `SIGTERM` tears down the HTTP listener and both
+worker pools through the SAME shared fan-out, not three separate handlers.
+Ensure your pod's `terminationGracePeriodSeconds` exceeds the longest
+in-flight `taskTimeoutMs` (30s default, §1.2) plus worker teardown time —
+45-60s is a safe floor.
 
 ## 3. Telemetry & Observability
 
@@ -272,9 +298,18 @@ Ship `exportSpanJson()`'s output as structured JSON — one line per exported
 trace — to your log aggregator; it is already a complete, self-describing
 JSON document with no additional formatting needed. A real OTLP collector can
 also ingest it directly, since the shape matches the spec, not an
-approximation of it.
+approximation of it. As of Phase 24.0, `POST /verify` (`src/server/index.ts`)
+does exactly this: every response body includes a `telemetry` field carrying
+that request's own `exportSpanJson()` output verbatim (`'OK'` on success,
+`'ERROR'` on a `CeilingAgentExhaustedError`).
 
-### 3.2 `WorkerGateOutcome.elapsedMs`
+`getGateLatencies()` (`src/telemetry/tracer.ts`, Phase 24.0) returns the same
+per-gate data (`{ gate, ok, elapsedMs }[]`) already held in the tracer's
+internal spans, without needing to re-parse `exportSpanJson()`'s OTLP
+attribute-value union — `GET /metrics`'s `recentGateLatenciesMs` (§3.2) is
+built from this.
+
+### 3.2 `WorkerGateOutcome.elapsedMs` and `GET /metrics`
 
 ```ts
 export interface WorkerGateOutcome {
@@ -295,6 +330,19 @@ verification — log `{ gate, ok, elapsedMs }` per outcome alongside the
 (`src/verification-floor.ts`) and should never disagree by more than
 scheduling jitter.
 
+`GET /metrics` (`src/server/index.ts`, Phase 24.0) exposes, as JSON:
+`uptimeSeconds`, `totalVerifications`/`failedVerifications`/
+`verificationsByDomain` (a running count `MetricsState` keeps across
+`/verify` calls), `recentGateLatenciesMs` (the last 50 `{gate, ok, elapsedMs}`
+samples across all requests, from `EngineTracer.getGateLatencies()` above),
+and `workerPool`/`brepWorkerPool` (`{ poolSize, recycledWorkerCount }`).
+**There is no live RSS reading in this payload** — neither
+`WorkerPoolEvaluator` nor `BRepWorkerPoolEvaluator` exposes one in its public
+API (§1.1's caveat: `process.memoryUsage().rss()` is process-wide even where
+it's read internally), so `recycledWorkerCount` is reported instead, as the
+real, available memory-pressure proxy — do not mistake its absence for the
+metric being forgotten.
+
 ### 3.3 Alert thresholds
 
 Grounded in the real defaults from §1-§2 — none of these are asserted in CI
@@ -313,7 +361,7 @@ top of real, already-emitted telemetry:
 
 ## Source-of-truth appendix
 
-Verified directly against `main` at `f9b92a6` (Phase 22.0). Re-verify this
+Verified directly against `main`, most recently at Phase 24.0. Re-verify this
 table, not just the prose above it, before trusting a number here after a
 future phase changes these files:
 
@@ -326,9 +374,14 @@ future phase changes these files:
 - B-Rep pool size default (`1`) — `src/layer1/brep/brep-worker-pool.ts:84`
 - `DEFAULT_OLLAMA_TIMEOUT_MS` — `src/CeilingAgent.ts:47`
 - Graceful shutdown / signal handling — `src/layer1/process-lifecycle.ts`
-- `EngineTracer` — `src/telemetry/tracer.ts`
+- `EngineTracer`, `getGateLatencies()` — `src/telemetry/tracer.ts`
 - `WorkerGateOutcome` — `src/layer1/worker-pool-worker.ts`
 - Generic gate/floor contract and `onGateComplete` timing hook — `src/verification-floor.ts`
 - CI Node version pin (`'20'`) — `.github/workflows/ci.yml:16`
-- No `process.env` reads relevant to these settings anywhere in `src/`, `lib/`, `bin/` — verified by repo-wide search, `f9b92a6`
-- No `Dockerfile`/Kubernetes manifest in this repository — verified by repo-wide search, `f9b92a6`
+- No `process.env` reads relevant to these settings anywhere in `src/CeilingAgent.ts`, `src/layer1/*` (excluding `src/server/`), `lib/` — verified by repo-wide search
+- No `Dockerfile`/Kubernetes manifest in this repository — verified by repo-wide search
+- **Phase 24.0 (HTTP runtime wrapper):**
+  - `loadServerConfig`, `ServerConfig`, env var names/defaults — `src/server/config.ts`
+  - `createServer`, `ServerDependencies`, route handlers, `RecycleWindowTracker`, `READY_RECYCLE_WINDOW_MS`/`READY_RECYCLE_THRESHOLD`, `MetricsState`, `main()`/graceful-shutdown wiring — `src/server/index.ts`
+  - Route/config/shutdown test coverage — `src/server/index.test.ts`
+  - `npm run server` script — `package.json`
