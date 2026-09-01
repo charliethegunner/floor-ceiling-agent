@@ -5,6 +5,7 @@
   "scripts": {
     "test": "vitest run",
     "benchmark": "tsx scripts/benchmark-live.ts",
+    "benchmark:sampler": "tsx scripts/benchmark-sampler.ts",
     "translate": "tsx bin/translate.ts"
   },
   "devDependencies": {
