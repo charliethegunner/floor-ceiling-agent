@@ -105,13 +105,13 @@ function checkCrossReference(candidate: ClaimCandidate): GateOutcome<'cross-refe
 // via a standalone smoke test before this was built on top of it.
 // ---------------------------------------------------------------------------
 
-async function importModule(modulePath: string): Promise<Record<string, unknown>> {
+export async function importModule(modulePath: string): Promise<Record<string, unknown>> {
   const absolutePath = path.resolve(process.cwd(), modulePath)
   const url = pathToFileURL(absolutePath).href
   return (await import(/* @vite-ignore */ url)) as Record<string, unknown>
 }
 
-function valuesEqual(actual: unknown, expected: unknown): boolean {
+export function valuesEqual(actual: unknown, expected: unknown): boolean {
   try {
     deepStrictEqual(actual, expected)
     return true
