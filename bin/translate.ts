@@ -1,6 +1,7 @@
+import { readFileSync } from 'node:fs'
 import { translateX86ToArm64 } from '../lib/index'
 import { translateInstruction } from '../lib/translator'
-import { verifyInstructionCandidate } from '../src/CeilingAgent'
+import { verifyInstructionCandidate, verifyTopologyCandidate, verifyClaimCandidate, type GateCheckResult } from '../src/CeilingAgent'
 
 const LABEL_LINE_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*:$/
 
@@ -17,16 +18,33 @@ export function normalizeSource(rawInput: string): string {
     .join('\n')
 }
 
+const DOMAINS = ['instruction', 'topology', 'claim'] as const
+export type Domain = (typeof DOMAINS)[number]
+
 export interface ParsedArgs {
   source: string
   verify: boolean
+  domain: Domain
 }
 
 export function parseArgs(argv: string[]): ParsedArgs | null {
   const verify = argv.includes('--verify')
-  const positional = argv.filter((arg) => arg !== '--verify')
+  let domain: Domain = 'instruction'
+  const positional: string[] = []
+
+  for (const arg of argv) {
+    if (arg === '--verify') continue
+    if (arg.startsWith('--domain=')) {
+      const value = arg.slice('--domain='.length)
+      if (!DOMAINS.includes(value as Domain)) return null
+      domain = value as Domain
+      continue
+    }
+    positional.push(arg)
+  }
+
   if (positional.length !== 1) return null
-  return { source: positional[0], verify }
+  return { source: positional[0], verify, domain }
 }
 
 /**
@@ -72,12 +90,50 @@ async function runVerification(normalizedSource: string): Promise<boolean> {
   return allPassed
 }
 
+/**
+ * Runs a JSON candidate file through the Topology or Claim VerificationFloor
+ * (verifyTopologyCandidate/verifyClaimCandidate, src/CeilingAgent.ts, Phase
+ * 5) and reports each gate - the same [PASS]/[FAIL] format runVerification
+ * uses for the instruction domain, but driving the whole floor directly
+ * since these domains have no "translation" step of their own.
+ */
+async function runDomainVerification(domain: 'topology' | 'claim', candidateText: string): Promise<boolean> {
+  const gates: GateCheckResult[] = domain === 'topology' ? await verifyTopologyCandidate(candidateText) : await verifyClaimCandidate(candidateText)
+
+  console.log(`\n--- Verification (${domain} floor) ---`)
+  let allPassed = true
+  for (const gate of gates) {
+    console.log(`[${gate.ok ? 'PASS' : 'FAIL'}] ${gate.gate}: ${gate.details}`)
+    if (!gate.ok) allPassed = false
+  }
+
+  console.log(`\n${allPassed ? 'All gates passed.' : 'One or more gates failed.'}`)
+  return allPassed
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2))
   if (args === null) {
-    console.error('Usage: translate "<x86 source>" [--verify]')
+    console.error('Usage: translate "<x86 source>" [--verify] [--domain=instruction|topology|claim]')
     console.error('Example: translate "mov rax, rbx; add rax, rcx" --verify')
+    console.error('Example: translate candidate.json --domain=topology')
+    console.error('Example: translate candidate.json --domain=claim')
     process.exitCode = 1
+    return
+  }
+
+  if (args.domain === 'topology' || args.domain === 'claim') {
+    let candidateText: string
+    try {
+      candidateText = readFileSync(args.source, 'utf-8')
+    } catch (error) {
+      console.error(`Could not read candidate file "${args.source}": ${error instanceof Error ? error.message : String(error)}`)
+      process.exitCode = 1
+      return
+    }
+
+    const allPassed = await runDomainVerification(args.domain, candidateText)
+    if (!allPassed) process.exitCode = 1
     return
   }
 

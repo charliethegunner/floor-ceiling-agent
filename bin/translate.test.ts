@@ -1,6 +1,9 @@
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, afterAll } from 'vitest'
 import { exec } from 'node:child_process'
 import { promisify } from 'node:util'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { normalizeSource, parseArgs } from './translate'
 
 const execAsync = promisify(exec)
@@ -47,18 +50,35 @@ describe('normalizeSource', () => {
 })
 
 describe('parseArgs', () => {
-  test('parses a source string with no flags', () => {
-    expect(parseArgs(['mov rax, rbx'])).toEqual({ source: 'mov rax, rbx', verify: false })
+  test('parses a source string with no flags, defaulting to the instruction domain', () => {
+    expect(parseArgs(['mov rax, rbx'])).toEqual({ source: 'mov rax, rbx', verify: false, domain: 'instruction' })
   })
 
   test('parses a source string with --verify in either position', () => {
-    expect(parseArgs(['mov rax, rbx', '--verify'])).toEqual({ source: 'mov rax, rbx', verify: true })
-    expect(parseArgs(['--verify', 'mov rax, rbx'])).toEqual({ source: 'mov rax, rbx', verify: true })
+    expect(parseArgs(['mov rax, rbx', '--verify'])).toEqual({ source: 'mov rax, rbx', verify: true, domain: 'instruction' })
+    expect(parseArgs(['--verify', 'mov rax, rbx'])).toEqual({ source: 'mov rax, rbx', verify: true, domain: 'instruction' })
   })
 
   test('returns null when no positional source argument is given', () => {
     expect(parseArgs([])).toBeNull()
     expect(parseArgs(['--verify'])).toBeNull()
+  })
+
+  test('parses --domain=topology and --domain=claim in either position', () => {
+    expect(parseArgs(['candidate.json', '--domain=topology'])).toEqual({ source: 'candidate.json', verify: false, domain: 'topology' })
+    expect(parseArgs(['--domain=claim', 'candidate.json'])).toEqual({ source: 'candidate.json', verify: false, domain: 'claim' })
+  })
+
+  test('--domain is combinable with --verify', () => {
+    expect(parseArgs(['candidate.json', '--domain=topology', '--verify'])).toEqual({
+      source: 'candidate.json',
+      verify: true,
+      domain: 'topology',
+    })
+  })
+
+  test('returns null for an unrecognized --domain value', () => {
+    expect(parseArgs(['candidate.json', '--domain=bogus'])).toBeNull()
   })
 })
 
@@ -93,5 +113,125 @@ describe('CLI integration: bin/translate.ts', () => {
 
     expect(result.exitCode).toBe(1)
     expect(result.stderr).toContain('Usage: translate')
+  }, 20000)
+
+  test('exits non-zero with usage instructions for an unrecognized --domain value', async () => {
+    const result = await runCli(['candidate.json', '--domain=bogus'])
+
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('Usage: translate')
+  }, 20000)
+})
+
+// ---------------------------------------------------------------------------
+// --domain=topology / --domain=claim: end-to-end CLI execution against the
+// Topology and Claim VerificationFloors (src/topology-floor.ts,
+// src/claim-floor.ts), reusing verifyTopologyCandidate/verifyClaimCandidate
+// (src/CeilingAgent.ts, Phase 5). The source argument for these domains is a
+// path to a JSON candidate file rather than inline text - unlike the
+// instruction domain's x86 source, a TopologyCandidate/ClaimCandidate is
+// structured JSON containing double quotes throughout, which would be
+// unreliable to pass as a single quoted shell argument (confirmed painful
+// on Windows cmd.exe); a file path sidesteps shell quoting entirely.
+// ---------------------------------------------------------------------------
+
+const tmpRoot = mkdtempSync(path.join(tmpdir(), 'translate-cli-'))
+afterAll(() => rmSync(tmpRoot, { recursive: true, force: true }))
+
+function writeCandidateFile(name: string, candidate: unknown): string {
+  const filePath = path.join(tmpRoot, name)
+  writeFileSync(filePath, JSON.stringify(candidate))
+  return filePath
+}
+
+const GOOD_TOPOLOGY_CANDIDATE = {
+  inMemoryFiles: {
+    'a.ts': "import { b } from './b'\nexport function a(): number { return b() }",
+    'b.ts': 'export function b(): number { return 42 }',
+  },
+  expectedExports: [{ filePath: 'a.ts', exportedNames: ['a'] }],
+  reachability: [{ from: { filePath: 'a.ts', functionName: 'a' }, to: { filePath: 'b.ts', functionName: 'b' }, expectReachable: true }],
+}
+
+const TOPOLOGY_CANDIDATE_WITH_MISSING_EXPORT = {
+  inMemoryFiles: {
+    'a.ts': "import { b } from './b'\nfunction a(): number { return b() }",
+    'b.ts': 'export function b(): number { return 42 }',
+  },
+  expectedExports: [{ filePath: 'a.ts', exportedNames: ['a'] }],
+  reachability: [],
+}
+
+describe('CLI integration: bin/translate.ts --domain=topology', () => {
+  test('a well-formed topology candidate passes all three gates and exits 0', async () => {
+    const filePath = writeCandidateFile('good-topology.json', GOOD_TOPOLOGY_CANDIDATE)
+    const result = await runCli([filePath, '--domain=topology'])
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain('[PASS] exports')
+    expect(result.stdout).toContain('[PASS] types')
+    expect(result.stdout).toContain('[PASS] reachability')
+    expect(result.stdout).toContain('All gates passed.')
+  }, 20000)
+
+  test('a candidate missing an expected export fails the exports gate and exits non-zero', async () => {
+    const filePath = writeCandidateFile('bad-topology.json', TOPOLOGY_CANDIDATE_WITH_MISSING_EXPORT)
+    const result = await runCli([filePath, '--domain=topology'])
+
+    expect(result.exitCode).toBe(1)
+    expect(result.stdout).toContain('[FAIL] exports')
+    expect(result.stdout).toContain('expected export "a" not found')
+    expect(result.stdout).toContain('One or more gates failed.')
+  }, 20000)
+
+  test('an unreadable candidate file path reports an error to stderr and exits non-zero', async () => {
+    const result = await runCli([path.join(tmpRoot, 'does-not-exist.json'), '--domain=topology'])
+
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('Could not read candidate file')
+  }, 20000)
+})
+
+const GOOD_CLAIM_CANDIDATE = {
+  claims: [
+    {
+      statement: 'translateInstruction lowers MOV RAX, RBX to MOV X0, X1',
+      subject: { modulePath: 'lib/translator.ts', exportName: 'translateInstruction' },
+      assertion: { args: ['MOV RAX, RBX'], expected: { ok: true, instruction: 'MOV X0, X1' } },
+    },
+  ],
+}
+
+const FALSE_CLAIM_CANDIDATE = {
+  claims: [
+    {
+      statement: 'translateInstruction lowers MOV RAX, RBX to MOV X1, X0',
+      subject: { modulePath: 'lib/translator.ts', exportName: 'translateInstruction' },
+      assertion: { args: ['MOV RAX, RBX'], expected: { ok: true, instruction: 'MOV X1, X0' } },
+    },
+  ],
+}
+
+describe('CLI integration: bin/translate.ts --domain=claim', () => {
+  test('a true claim about a real, committed repository function passes all three gates and exits 0', async () => {
+    const filePath = writeCandidateFile('good-claim.json', GOOD_CLAIM_CANDIDATE)
+    const result = await runCli([filePath, '--domain=claim'])
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain('[PASS] structural')
+    expect(result.stdout).toContain('[PASS] cross-reference')
+    expect(result.stdout).toContain('[PASS] empirical')
+    expect(result.stdout).toContain('All gates passed.')
+  }, 20000)
+
+  test('a false claim is caught by the empirical gate, by actually running the function, and exits non-zero', async () => {
+    const filePath = writeCandidateFile('false-claim.json', FALSE_CLAIM_CANDIDATE)
+    const result = await runCli([filePath, '--domain=claim'])
+
+    expect(result.exitCode).toBe(1)
+    expect(result.stdout).toContain('[PASS] structural')
+    expect(result.stdout).toContain('[PASS] cross-reference')
+    expect(result.stdout).toContain('[FAIL] empirical')
+    expect(result.stdout).toContain('One or more gates failed.')
   }, 20000)
 })
