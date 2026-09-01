@@ -346,7 +346,7 @@ describe('TaskGraphExecutor: Phase 15.1 - brep node dispatch to BRepWorkerPoolEv
     expect(result.ok).toBe(true)
     const node = result.nodes[0]
     expect(node.status).toBe('ok')
-    expect(node.status === 'ok' && node.success.gates.map((g) => g.gate)).toEqual(['structural-validity', 'volumetric-bound'])
+    expect(node.status === 'ok' && node.success.gates.map((g) => g.gate)).toEqual(['structural-validity', 'volumetric-bound', 'step-export'])
     expect(node.status === 'ok' && node.success.gates.every((g) => g.ok)).toBe(true)
   }, 15000)
 

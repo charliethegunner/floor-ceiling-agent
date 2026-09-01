@@ -353,10 +353,16 @@ const PROMPT_HEADERS: Record<CeilingRequestKind, (description: string) => string
   brep: (description) => [
     `Propose a solid B-Rep (Boundary Representation) CAD shape satisfying this: ${description}`,
     'Respond with ONLY a JSON object matching the BRepCandidate shape: ' +
-      '{ solid: BRepNode, boundingBox: { min: [x,y,z], max: [x,y,z] } }, where BRepNode is one of ' +
+      '{ solid: BRepNode, boundingBox: { min: [x,y,z], max: [x,y,z] }, exportStep?: boolean }, where BRepNode is one of ' +
       '{ type: "box", center: [x,y,z], halfExtents: [x,y,z] }, { type: "cylinder", baseCenter: [x,y,z], radius, height }, ' +
-      '{ type: "sphere", center: [x,y,z], radius }, { type: "union"|"intersection", children: BRepNode[] }, or ' +
-      '{ type: "subtraction", a: BRepNode, b: BRepNode } - no explanation, no markdown fences.',
+      '{ type: "sphere", center: [x,y,z], radius }, { type: "union"|"intersection", children: BRepNode[] }, ' +
+      '{ type: "subtraction", a: BRepNode, b: BRepNode }, ' +
+      '{ type: "fillet", child: BRepNode, edgeIndices: number[], radius }, ' +
+      '{ type: "chamfer", child: BRepNode, edgeIndices: number[], distance }, ' +
+      '{ type: "shell", child: BRepNode, faceIndices: number[], thickness } (opens the selected faces, hollowing the solid inward), or ' +
+      '{ type: "draftAngle", child: BRepNode, faceIndices: number[], angleDegrees, pullDirection: [x,y,z] } - ' +
+      'edgeIndices/faceIndices select edges/faces of the CHILD solid by index (0-based, in an order you cannot predict in advance - ' +
+      'if a retry reports "valid range 0-N", pick an index in that range) - no explanation, no markdown fences.',
   ],
 }
 

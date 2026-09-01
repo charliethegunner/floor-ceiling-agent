@@ -1004,7 +1004,7 @@ const DEGENERATE_BREP_CANDIDATE: BRepCandidate = {
 describe('verifyBRepCandidate: routes through BREP_VERIFICATION_FLOOR (Phase 15.1)', () => {
   test('a well-formed box passes both real gates', async () => {
     const gates = await verifyBRepCandidate(JSON.stringify(GOOD_BREP_CANDIDATE))
-    expect(gates.map((g) => g.gate)).toEqual(['structural-validity', 'volumetric-bound'])
+    expect(gates.map((g) => g.gate)).toEqual(['structural-validity', 'volumetric-bound', 'step-export'])
     expect(gates.every((g) => g.ok)).toBe(true)
   }, 15000)
 
@@ -1045,7 +1045,7 @@ describe('runCeilingAgent: brep domain routing, standalone in-process (Phase 15.
 
     expect(result.ok).toBe(true)
     expect(result.attempts).toBe(1)
-    expect(result.gates.map((g) => g.gate)).toEqual(['structural-validity', 'volumetric-bound'])
+    expect(result.gates.map((g) => g.gate)).toEqual(['structural-validity', 'volumetric-bound', 'step-export'])
   }, 15000)
 
   test('self-corrects after a degenerate candidate and succeeds on retry', async () => {

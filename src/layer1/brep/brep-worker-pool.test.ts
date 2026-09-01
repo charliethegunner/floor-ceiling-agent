@@ -55,7 +55,7 @@ describe('BRepWorkerPoolEvaluator: genuinely verifies real B-Rep geometry inside
   test('a well-formed box passes both real gates through the real worker', async () => {
     const pool = trackedPool()
     const gates = await pool.verify(task(), NEVER_CALLED)
-    expect(gates.map((g) => g.gate)).toEqual(['structural-validity', 'volumetric-bound'])
+    expect(gates.map((g) => g.gate)).toEqual(['structural-validity', 'volumetric-bound', 'step-export'])
     expect(gates.every((g) => g.ok)).toBe(true)
   }, 15000)
 
