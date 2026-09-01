@@ -6,6 +6,7 @@ import {
   verifyInstructionCandidate,
   verifyTopologyCandidate,
   verifyClaimCandidate,
+  verifySpatialCandidate,
   buildPrompt,
   type LlmClient,
   type CeilingRequest,
@@ -13,6 +14,7 @@ import {
 } from './CeilingAgent'
 import type { TopologyCandidate } from './topology-floor'
 import type { ClaimCandidate } from './claim-floor'
+import type { SpatialCandidate } from './spatial-floor'
 
 class ScriptedLlmClient implements LlmClient {
   private index = 0
@@ -835,5 +837,90 @@ describe('runCeilingAgent: opt-in Best-of-N parallel sampling (Phase 6)', () => 
 
     expect(result.ok).toBe(true)
     expect(result.gates.map((g) => g.gate)).toEqual(['structural', 'cross-reference', 'empirical'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 7: routing to the real SPATIAL_VERIFICATION_FLOOR (src/spatial-floor.ts,
+// 'continuity'/'volumetric-bound'/'self-intersection'), through the SAME JSON
+// + fence-stripping pattern verifyTopologyCandidate/verifyClaimCandidate
+// already use (Phase 5/5.1) - a new domain means one new VERIFIERS/
+// PROMPT_HEADERS entry, not a new branch in the retry loop itself.
+// ---------------------------------------------------------------------------
+
+const GOOD_SPATIAL_CANDIDATE: SpatialCandidate = {
+  surface: { type: 'sphere', center: [0, 0, 0], radius: 1 },
+  boundingBox: { min: [-2, -2, -2], max: [2, 2, 2] },
+}
+
+// Fails the self-intersection gate: a negative radius is a structurally
+// degenerate primitive (see spatial-floor.ts's validatePrimitiveManifold).
+const DEGENERATE_SPATIAL_CANDIDATE: SpatialCandidate = {
+  surface: { type: 'sphere', center: [0, 0, 0], radius: -1 },
+  boundingBox: { min: [-2, -2, -2], max: [2, 2, 2] },
+}
+
+describe('verifySpatialCandidate: routes through SPATIAL_VERIFICATION_FLOOR (Phase 7)', () => {
+  test('a well-formed sphere strictly within its bounding box passes all three gates in order', async () => {
+    const gates = await verifySpatialCandidate(JSON.stringify(GOOD_SPATIAL_CANDIDATE))
+    expect(gates.map((g) => g.gate)).toEqual(['continuity', 'volumetric-bound', 'self-intersection'])
+    expect(gates.every((g) => g.ok)).toBe(true)
+  })
+
+  test('a degenerate (negative-radius) candidate is caught by the self-intersection gate', async () => {
+    const gates = await verifySpatialCandidate(JSON.stringify(DEGENERATE_SPATIAL_CANDIDATE))
+    const selfIntersection = gates.find((g) => g.gate === 'self-intersection')
+    expect(selfIntersection?.ok).toBe(false)
+    expect(selfIntersection?.details).toContain('radius')
+  })
+
+  test('malformed JSON is reported as a gate failure, not an uncaught exception', async () => {
+    const gates = await verifySpatialCandidate('not valid json {{{')
+    expect(gates).toHaveLength(1)
+    expect(gates[0].ok).toBe(false)
+    expect(gates[0].gate).toBe('continuity')
+  })
+
+  test('a markdown-fenced candidate is parsed and verified normally (Phase 5.1 fence-stripping applies here too)', async () => {
+    const gates = await verifySpatialCandidate('```json\n' + JSON.stringify(GOOD_SPATIAL_CANDIDATE) + '\n```')
+    expect(gates.every((g) => g.ok)).toBe(true)
+  })
+})
+
+describe('buildPrompt: routes a spatial request to JSON instructions (Phase 7)', () => {
+  test('a spatial request asks for JSON, not ARM64 or plain TypeScript instructions', () => {
+    const prompt = buildPrompt({ kind: 'spatial', description: 'a sphere of radius 1 at the origin' }, [])
+    expect(prompt).toContain('a sphere of radius 1 at the origin')
+    expect(prompt).toContain('JSON')
+    expect(prompt).not.toContain('ARM64 instruction text')
+  })
+})
+
+describe('runCeilingAgent: spatial domain routing, including Best-of-N (Phase 7)', () => {
+  test('accepts a well-formed spatial candidate on the first attempt (sequential path)', async () => {
+    const llm = new ScriptedLlmClient([JSON.stringify(GOOD_SPATIAL_CANDIDATE)])
+    const result = await runCeilingAgent({ kind: 'spatial', description: 'a sphere of radius 1 at the origin' }, llm)
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(1)
+    expect(result.gates.map((g) => g.gate)).toEqual(['continuity', 'volumetric-bound', 'self-intersection'])
+  })
+
+  test('Best-of-N sampling generates several candidate CSG surfaces in parallel and selects the one that passes SPATIAL_VERIFICATION_FLOOR', async () => {
+    // Default bestOfN config: sampleSize 4, temperatures 0.2/0.4/0.6/0.8.
+    // Only the 0.8 candidate is a valid, non-degenerate, in-bounds surface.
+    const llm = new TemperatureRoutedLlmClient((t) => JSON.stringify(t === 0.8 ? GOOD_SPATIAL_CANDIDATE : DEGENERATE_SPATIAL_CANDIDATE))
+
+    const result = await runCeilingAgent(
+      { kind: 'spatial', description: 'a sphere of radius 1 centered at the origin, within a [-2,2]^3 bounding box' },
+      llm,
+      { bestOfN: {} }
+    )
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(1)
+    expect(llm.callCount).toBe(4)
+    expect(result.gates.map((g) => g.gate)).toEqual(['continuity', 'volumetric-bound', 'self-intersection'])
+    expect(JSON.parse(result.result)).toEqual(GOOD_SPATIAL_CANDIDATE)
   })
 })

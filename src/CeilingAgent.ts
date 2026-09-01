@@ -4,6 +4,7 @@ import { getZ3, checkPushEquivalence, checkPopEquivalence, checkMemoryEquivalenc
 import { type VerificationFloor, type GateOutcome, runVerificationFloor } from './verification-floor'
 import { TOPOLOGY_FLOOR, type TopologyCandidate } from './topology-floor'
 import { CLAIM_VERIFICATION_FLOOR, type ClaimCandidate } from './claim-floor'
+import { SPATIAL_VERIFICATION_FLOOR, type SpatialCandidate } from './spatial-floor'
 import { ParallelCandidateSampler } from './layer3/sampler'
 import type { TemperatureStrategy } from './layer3/types'
 
@@ -59,14 +60,15 @@ export class OpenAiCompatibleLlmClient implements LlmClient {
 // Request / result shapes
 // ---------------------------------------------------------------------------
 
-export type CeilingRequestKind = 'instruction' | 'patch' | 'topology' | 'claim'
+export type CeilingRequestKind = 'instruction' | 'patch' | 'topology' | 'claim' | 'spatial'
 
 export interface CeilingRequest {
   kind: CeilingRequestKind
   /** 'instruction': the x86 instruction text to translate.
    *  'patch': a prose description of the TypeScript function to generate.
    *  'topology': a prose description of the module layout to propose.
-   *  'claim': a prose description of the claim to produce and verify. */
+   *  'claim': a prose description of the claim to produce and verify.
+   *  'spatial': a prose description of the SDF/CSG surface to propose. */
   description: string
 }
 
@@ -486,6 +488,16 @@ export async function verifyClaimCandidate(candidateText: string): Promise<GateC
   }
 }
 
+export async function verifySpatialCandidate(candidateText: string): Promise<GateCheckResult[]> {
+  try {
+    const parsed = JSON.parse(stripJsonFences(candidateText)) as SpatialCandidate
+    const report = await runVerificationFloor(SPATIAL_VERIFICATION_FLOOR, parsed)
+    return report.gates
+  } catch (error) {
+    return [{ gate: SPATIAL_VERIFICATION_FLOOR.gates[0].name, ok: false, details: `candidate could not be verified: ${error instanceof Error ? error.message : String(error)}` }]
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Retry loop
 // ---------------------------------------------------------------------------
@@ -538,6 +550,15 @@ const PROMPT_HEADERS: Record<CeilingRequestKind, (description: string) => string
       '{ claims: [{ statement, subject: { modulePath, exportName }, assertion: { args, expected } }] } - ' +
       'no explanation, no markdown fences.',
   ],
+  spatial: (description) => [
+    `Propose a Signed Distance Function (SDF) / CSG surface satisfying this: ${description}`,
+    'Respond with ONLY a JSON object matching the SpatialCandidate shape: ' +
+      '{ surface: SdfNode, boundingBox: { min: [x,y,z], max: [x,y,z] } }, where SdfNode is one of ' +
+      '{ type: "sphere", center: [x,y,z], radius }, { type: "box", center: [x,y,z], halfExtents: [x,y,z] }, ' +
+      '{ type: "plane", normal: [x,y,z], distance }, { type: "torus", center: [x,y,z], majorRadius, minorRadius }, ' +
+      '{ type: "union"|"intersection", children: SdfNode[] }, or { type: "subtraction", a: SdfNode, b: SdfNode } - ' +
+      'no explanation, no markdown fences.',
+  ],
 }
 
 // Dynamic multi-domain routing (Phase 5): each request kind maps to the
@@ -549,6 +570,7 @@ const VERIFIERS: Record<CeilingRequestKind, (request: CeilingRequest, candidate:
   patch: (_request, candidate) => verifyPatchCandidate(candidate),
   topology: (_request, candidate) => verifyTopologyCandidate(candidate),
   claim: (_request, candidate) => verifyClaimCandidate(candidate),
+  spatial: (_request, candidate) => verifySpatialCandidate(candidate),
 }
 
 // ---------------------------------------------------------------------------
