@@ -120,6 +120,17 @@ function valuesEqual(actual: unknown, expected: unknown): boolean {
   }
 }
 
+// A live benchmark run (scripts/benchmark-live.ts) found models resubmitting
+// an identical wrong claim across every retry, because the old "expected X,
+// got Y" message only echoed the model's own (possibly inaccurate) prose
+// statement - it never showed what was actually called. describeCall makes
+// the counterexample self-contained: the exact module#export(args) that was
+// really invoked, independent of whatever the statement claims.
+function describeCall(claim: Claim): string {
+  const args = claim.assertion.args.map((arg) => JSON.stringify(arg)).join(', ')
+  return `${claim.subject.modulePath}#${claim.subject.exportName}(${args})`
+}
+
 async function checkEmpirical(candidate: ClaimCandidate): Promise<GateOutcome<'empirical'>> {
   const failures: string[] = []
 
@@ -128,15 +139,15 @@ async function checkEmpirical(candidate: ClaimCandidate): Promise<GateOutcome<'e
       const mod = await importModule(claim.subject.modulePath)
       const fn = mod[claim.subject.exportName]
       if (typeof fn !== 'function') {
-        failures.push(`"${claim.statement}": "${claim.subject.exportName}" is not callable`)
+        failures.push(`"${claim.statement}": ${describeCall(claim)} is not callable`)
         continue
       }
       const actual: unknown = await fn(...claim.assertion.args)
       if (!valuesEqual(actual, claim.assertion.expected)) {
-        failures.push(`"${claim.statement}": expected ${JSON.stringify(claim.assertion.expected)}, got ${JSON.stringify(actual)}`)
+        failures.push(`"${claim.statement}": ${describeCall(claim)} expected ${JSON.stringify(claim.assertion.expected)}, got ${JSON.stringify(actual)}`)
       }
     } catch (error) {
-      failures.push(`"${claim.statement}": threw ${error instanceof Error ? error.message : String(error)}`)
+      failures.push(`"${claim.statement}": ${describeCall(claim)} threw ${error instanceof Error ? error.message : String(error)}`)
     }
   }
 

@@ -150,17 +150,25 @@ async function discoverModels(): Promise<string[]> {
 }
 
 // ---------------------------------------------------------------------------
-// Task suite: 20 tasks across 5 categories. Arithmetic/stack/shifts/memory
-// all have real Z3 ground truth in CeilingAgent (extended in Phase 3 to
-// cover PUSH/POP and SIB memory by reusing FloorEngine's Gate 3 checks, and
-// SHL/SHR as new ALU semantics) - those are genuine correctness proofs, not
-// just shape checks. Control-flow tasks (JMP/CALL/RET/Jcc) have no register-
-// transfer ground truth by design (they don't move register *values*), so
-// their symbolic gate legitimately reports "skipped, not a failure" - the
-// static and fuzz gates still meaningfully check them.
+// Task suite: 28 tasks across 7 categories, spanning all three
+// VerificationFloors CeilingAgent dynamically routes to (Phase 5).
+// Arithmetic/stack/shifts/memory all have real Z3 ground truth in
+// CeilingAgent (extended in Phase 3 to cover PUSH/POP and SIB memory by
+// reusing FloorEngine's Gate 3 checks, and SHL/SHR as new ALU semantics) -
+// those are genuine correctness proofs, not just shape checks. Control-flow
+// tasks (JMP/CALL/RET/Jcc) have no register-transfer ground truth by design
+// (they don't move register *values*), so their symbolic gate legitimately
+// reports "skipped, not a failure" - the static and fuzz gates still
+// meaningfully check them. The topology and claim categories exercise the
+// two floors added in Phase 4.1/4.2 and wired into CeilingAgent in Phase 5
+// (src/topology-floor.ts, src/claim-floor.ts) - a genuinely different kind
+// of task for the model: instead of one line of ARM64, it must emit a JSON
+// payload matching a multi-field schema, self-consistent with code it wrote
+// itself (topology) or with this repository's actual runtime behavior
+// (claim, checked by really executing the claimed function).
 // ---------------------------------------------------------------------------
 
-type Category = 'arithmetic' | 'stack' | 'shifts' | 'memory' | 'control-flow'
+type Category = 'arithmetic' | 'stack' | 'shifts' | 'memory' | 'control-flow' | 'topology' | 'claim'
 
 interface Task {
   category: Category
@@ -197,6 +205,89 @@ const TASKS: Task[] = [
   { category: 'control-flow', request: { kind: 'instruction', description: 'JE done' } },
   { category: 'control-flow', request: { kind: 'instruction', description: 'CALL RCX' } },
   { category: 'control-flow', request: { kind: 'instruction', description: 'RET' } },
+
+  // topology: the model must emit a self-consistent TopologyCandidate JSON -
+  // code it wrote itself, plus expectedExports/reachability declarations
+  // that must actually hold against that code.
+  {
+    category: 'topology',
+    request: {
+      kind: 'topology',
+      description:
+        'a single module double.ts exporting a function double(x: number): number that returns x * 2. ' +
+        'Declare expectedExports for double.ts exporting "double", and an empty reachability array.',
+    },
+  },
+  {
+    category: 'topology',
+    request: {
+      kind: 'topology',
+      description:
+        'two modules: a.ts exports a function a(): number that imports and calls b from b.ts and returns its result, ' +
+        'and b.ts exports a function b(): number that returns 42. Declare expectedExports for a.ts exporting "a", ' +
+        'and one reachability expectation that a.ts#a can reach b.ts#b (expectReachable: true).',
+    },
+  },
+  {
+    category: 'topology',
+    request: {
+      kind: 'topology',
+      description:
+        'two independent modules with no calls between them: x.ts exports a function x(): number returning 1, ' +
+        'and y.ts exports a function y(): number returning 2. Declare expectedExports for x.ts exporting "x", ' +
+        'and one reachability expectation that x.ts#x can NOT reach y.ts#y (expectReachable: false).',
+    },
+  },
+  {
+    category: 'topology',
+    request: {
+      kind: 'topology',
+      description:
+        'a three-module call chain: p.ts exports p(): number that calls q from q.ts, q.ts exports q(): number that ' +
+        'calls r from r.ts, and r.ts exports r(): number that returns 7. Declare expectedExports for p.ts exporting "p", ' +
+        'and one reachability expectation that p.ts#p can reach r.ts#r (multi-hop, expectReachable: true).',
+    },
+  },
+
+  // claim: the model must know this repository's ACTUAL behavior - the
+  // empirical gate really imports and calls the named function, so a
+  // plausible-sounding but wrong claim is caught by execution, not review.
+  {
+    category: 'claim',
+    request: {
+      kind: 'claim',
+      description:
+        'lib/translator.ts exports translateInstruction. Claim that calling it with the single argument "MOV RAX, RBX" ' +
+        'returns exactly {"ok":true,"instruction":"MOV X0, X1"}.',
+    },
+  },
+  {
+    category: 'claim',
+    request: {
+      kind: 'claim',
+      description:
+        'lib/translator.ts exports translateInstruction. Claim that calling it with the single argument "CMP RAX, RBX" ' +
+        'returns exactly {"ok":true,"instruction":"CMP X0, X1"}.',
+    },
+  },
+  {
+    category: 'claim',
+    request: {
+      kind: 'claim',
+      description:
+        'lib/index.ts exports translateX86ToArm64. Claim that calling it with the single argument "ADD RAX, RBX" ' +
+        'returns exactly {"ok":true,"instruction":"ADD X0, X0, X1"}.',
+    },
+  },
+  {
+    category: 'claim',
+    request: {
+      kind: 'claim',
+      description:
+        'lib/translator.ts exports translateInstruction. Claim that calling it with the single argument "SUB RCX, RAX" ' +
+        'returns exactly {"ok":true,"instruction":"SUB X2, X2, X0"}.',
+    },
+  },
 ]
 
 // ---------------------------------------------------------------------------
@@ -219,10 +310,21 @@ function logHistory(history: Array<{ attempt: number; candidate: string; failedG
   }
 }
 
+// Fault injection assumes an ARM64 instruction candidate (see
+// injectOperandSwapFault's own docs) - applying it to a topology/claim
+// task's JSON candidate would just corrupt arbitrary punctuation, not
+// exercise a realistic mistake. Those domains get no injected fault: any
+// self-correction cycle they show is driven entirely by the model's own
+// JSON/schema/factual mistakes, which is itself an interesting signal for a
+// small local model attempting a genuinely different task shape.
+function buildLlmClient(task: Task, tracker: InstrumentedOllamaClient): LlmClient {
+  return task.request.kind === 'instruction' ? new FaultInjectingLlmClient(tracker) : tracker
+}
+
 async function runTask(model: string, task: Task): Promise<TaskOutcome> {
   console.log(`--- [${model}] ${task.category}: ${task.request.description} ---`)
   const tracker = new InstrumentedOllamaClient(BASE_URL, model)
-  const llm = new FaultInjectingLlmClient(tracker)
+  const llm = buildLlmClient(task, tracker)
   const start = performance.now()
 
   const summarizeTokens = () => tracker.usage.reduce((sum, u) => sum + (u.totalTokens ?? 0), 0)
@@ -310,7 +412,10 @@ async function main() {
   console.log(`Live CeilingAgent benchmark against ${BASE_URL}`)
   console.log(`Models under evaluation: ${models.join(', ')}`)
   console.log(`Task suite: ${TASKS.length} tasks across ${new Set(TASKS.map((t) => t.category)).size} categories`)
-  console.log('Attempt 1 of each task has a deliberately injected fault where the response has 2+ operands.\n')
+  console.log(
+    'Attempt 1 of each instruction-domain task has a deliberately injected fault where the response has 2+ operands. ' +
+      'Topology and claim domain tasks run with no injected fault.\n'
+  )
 
   const byModel = new Map<string, TaskOutcome[]>()
 

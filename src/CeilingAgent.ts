@@ -442,11 +442,28 @@ function verifyPatchCandidate(candidate: string): GateCheckResult[] {
 // failure of that floor's first gate, matching verifyPatchCandidate's
 // "unparseable candidate fails the first gate" precedent - never left as an
 // uncaught exception that would break the retry loop.
+//
+// A live benchmark run (scripts/benchmark-live.ts) found real local models
+// wrapping their JSON in a ```json ... ``` fence despite the prompt
+// explicitly saying "no markdown fences" - every fenced attempt failed
+// JSON.parse identically, and since the model kept resubmitting the same
+// fenced text on each retry, self-correction never happened across the
+// whole retry budget. stripJsonFences removes a wrapping fence (with or
+// without a language tag) before parsing, so a fenced-but-otherwise-valid
+// candidate is accepted rather than burning every retry on formatting.
 // ---------------------------------------------------------------------------
+
+const JSON_FENCE_PATTERN = /^```[a-zA-Z]*\r?\n([\s\S]*?)\r?\n?```$/
+
+function stripJsonFences(candidateText: string): string {
+  const trimmed = candidateText.trim()
+  const match = JSON_FENCE_PATTERN.exec(trimmed)
+  return match ? match[1].trim() : trimmed
+}
 
 export async function verifyTopologyCandidate(candidateText: string): Promise<GateCheckResult[]> {
   try {
-    const parsed = JSON.parse(candidateText) as TopologyCandidate
+    const parsed = JSON.parse(stripJsonFences(candidateText)) as TopologyCandidate
     const report = await runVerificationFloor(TOPOLOGY_FLOOR, parsed)
     return report.gates
   } catch (error) {
@@ -456,7 +473,7 @@ export async function verifyTopologyCandidate(candidateText: string): Promise<Ga
 
 export async function verifyClaimCandidate(candidateText: string): Promise<GateCheckResult[]> {
   try {
-    const parsed = JSON.parse(candidateText) as ClaimCandidate
+    const parsed = JSON.parse(stripJsonFences(candidateText)) as ClaimCandidate
     const report = await runVerificationFloor(CLAIM_VERIFICATION_FLOOR, parsed)
     return report.gates
   } catch (error) {

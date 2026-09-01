@@ -177,6 +177,77 @@ describe('CLAIM_VERIFICATION_FLOOR: empirical gate (real execution against this 
     expect(result.ok).toBe(false)
     expect(result.details).toContain('is not callable')
   })
+
+  // Enriched failure feedback (found via a live benchmark, scripts/benchmark-live.ts):
+  // models kept resubmitting an identical wrong claim across every retry
+  // because the old "expected X, got Y" message never showed WHAT was
+  // actually called - just the model's own (possibly inaccurate) prose
+  // statement. Every empirical failure now names the exact call
+  // (modulePath#exportName(args...)) that was made, so the counterexample
+  // is self-contained and doesn't depend on the statement being accurate.
+  test('a wrong-value failure names the exact call that was made, not just the model\'s prose statement', async () => {
+    const result = await runGate('empirical', {
+      claims: [
+        {
+          statement: 'a deliberately wrong claim',
+          subject: { modulePath: 'lib/translator.ts', exportName: 'translateInstruction' },
+          assertion: { args: ['MOV RAX, RBX'], expected: { ok: true, instruction: 'MOV X1, X0' } },
+        },
+      ],
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.details).toContain('lib/translator.ts#translateInstruction("MOV RAX, RBX")')
+    expect(result.details).toContain('expected')
+    expect(result.details).toContain('got')
+  })
+
+  test('a thrown-error failure names the exact call that was made', async () => {
+    const result = await runGate('empirical', {
+      claims: [
+        {
+          statement: 'calling translateInstruction with no argument',
+          subject: { modulePath: 'lib/translator.ts', exportName: 'translateInstruction' },
+          assertion: { args: [], expected: { ok: false, error: 'anything' } },
+        },
+      ],
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.details).toContain('lib/translator.ts#translateInstruction()')
+    expect(result.details).toContain('threw')
+  })
+
+  test('a non-callable-export failure names the module path alongside the export name', async () => {
+    const result = await runGate('empirical', {
+      claims: [
+        {
+          statement: 'registerMap is not a function',
+          subject: { modulePath: 'lib/translator.ts', exportName: 'registerMap' },
+          assertion: { args: [], expected: null },
+        },
+      ],
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.details).toContain('lib/translator.ts#registerMap')
+    expect(result.details).toContain('is not callable')
+  })
+
+  test('multiple call arguments are each rendered individually in the call signature', async () => {
+    const result = await runGate('empirical', {
+      claims: [
+        {
+          statement: 'a claim with two arguments, deliberately wrong',
+          subject: { modulePath: 'lib/translator.ts', exportName: 'translateInstruction' },
+          assertion: { args: ['MOV RAX, RBX', 'extra'], expected: { ok: true, instruction: 'anything' } },
+        },
+      ],
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.details).toContain('lib/translator.ts#translateInstruction("MOV RAX, RBX", "extra")')
+  })
 })
 
 describe('CLAIM_VERIFICATION_FLOOR: full floor via runVerificationFloor', () => {

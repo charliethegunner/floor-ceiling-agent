@@ -538,6 +538,90 @@ describe('runCeilingAgent: claim domain routing (Phase 5)', () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// Markdown-fenced JSON handling: a live benchmark run (scripts/benchmark-live.ts)
+// found real local models wrapping their JSON candidate in ```json ... ```
+// fences despite the prompt explicitly saying "no markdown fences" - every
+// fenced attempt failed JSON.parse identically, and since the model kept
+// resubmitting the same fenced text, self-correction never happened across
+// all 5 retries. verifyTopologyCandidate/verifyClaimCandidate now strip a
+// wrapping fence before parsing, so a fenced-but-otherwise-valid candidate
+// is accepted rather than burning the entire retry budget on formatting.
+// ---------------------------------------------------------------------------
+
+function fenced(json: string, lang = 'json'): string {
+  return '```' + lang + '\n' + json + '\n```'
+}
+
+describe('verifyTopologyCandidate: strips a wrapping markdown code fence before parsing', () => {
+  test('a ```json-fenced candidate is parsed and verified normally', async () => {
+    const gates = await verifyTopologyCandidate(fenced(JSON.stringify(GOOD_TOPOLOGY_CANDIDATE)))
+    expect(gates.map((g) => g.gate)).toEqual(['exports', 'types', 'reachability'])
+    expect(gates.every((g) => g.ok)).toBe(true)
+  })
+
+  test('a bare ```-fenced candidate (no "json" language tag) is parsed and verified normally', async () => {
+    const gates = await verifyTopologyCandidate(fenced(JSON.stringify(GOOD_TOPOLOGY_CANDIDATE), ''))
+    expect(gates.every((g) => g.ok)).toBe(true)
+  })
+
+  test('surrounding whitespace around the fence is tolerated', async () => {
+    const gates = await verifyTopologyCandidate(`\n\n  ${fenced(JSON.stringify(GOOD_TOPOLOGY_CANDIDATE))}  \n\n`)
+    expect(gates.every((g) => g.ok)).toBe(true)
+  })
+
+  test('a fenced candidate that fails a real gate still reports that gate failure, not a parse error', async () => {
+    const gates = await verifyTopologyCandidate(fenced(JSON.stringify(TOPOLOGY_CANDIDATE_WITH_MISSING_EXPORT)))
+    const exportsGate = gates.find((g) => g.gate === 'exports')
+    expect(exportsGate?.ok).toBe(false)
+    expect(exportsGate?.details).toContain('expected export "a" not found')
+  })
+
+  test('a fence wrapping genuinely invalid JSON is still reported as a gate failure, not an uncaught exception', async () => {
+    const gates = await verifyTopologyCandidate(fenced('not valid json {{{'))
+    expect(gates).toHaveLength(1)
+    expect(gates[0].ok).toBe(false)
+    expect(gates[0].gate).toBe('exports')
+  })
+})
+
+describe('verifyClaimCandidate: strips a wrapping markdown code fence before parsing', () => {
+  test('a ```json-fenced candidate is parsed and verified normally', async () => {
+    const gates = await verifyClaimCandidate(fenced(JSON.stringify(GOOD_CLAIM_CANDIDATE)))
+    expect(gates.map((g) => g.gate)).toEqual(['structural', 'cross-reference', 'empirical'])
+    expect(gates.every((g) => g.ok)).toBe(true)
+  })
+
+  test('a bare ```-fenced candidate (no "json" language tag) is parsed and verified normally', async () => {
+    const gates = await verifyClaimCandidate(fenced(JSON.stringify(GOOD_CLAIM_CANDIDATE), ''))
+    expect(gates.every((g) => g.ok)).toBe(true)
+  })
+
+  test('a fenced false claim still reports the empirical failure, not a parse error', async () => {
+    const gates = await verifyClaimCandidate(fenced(JSON.stringify(FALSE_CLAIM_CANDIDATE)))
+    const empirical = gates.find((g) => g.gate === 'empirical')
+    expect(empirical?.ok).toBe(false)
+  })
+})
+
+describe('runCeilingAgent: a markdown-fenced JSON response no longer wastes a retry (Phase 5 fix)', () => {
+  test('a fenced topology candidate is accepted on the very first attempt', async () => {
+    const llm = new ScriptedLlmClient([fenced(JSON.stringify(GOOD_TOPOLOGY_CANDIDATE))])
+    const result = await runCeilingAgent({ kind: 'topology', description: 'a module a.ts that calls b.ts#b' }, llm)
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(1)
+  })
+
+  test('a fenced claim candidate is accepted on the very first attempt', async () => {
+    const llm = new ScriptedLlmClient([fenced(JSON.stringify(GOOD_CLAIM_CANDIDATE))])
+    const result = await runCeilingAgent({ kind: 'claim', description: 'MOV RAX, RBX lowers to MOV X0, X1' }, llm)
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(1)
+  })
+})
+
 describe('buildPrompt: routes domain-specific instructions for topology and claim kinds (Phase 5)', () => {
   test('a topology request asks for JSON, not ARM64 or plain TypeScript instructions', () => {
     const prompt = buildPrompt({ kind: 'topology', description: 'a module a.ts that calls b.ts#b' }, [])
