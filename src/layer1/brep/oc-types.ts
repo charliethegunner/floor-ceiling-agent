@@ -64,6 +64,29 @@ export interface BRepBooleanOperation extends OcDisposable {
 
 export interface BRepCheckAnalyzer extends OcDisposable {
   IsValid_2(): boolean
+  Result(subShape: TopoDsShape): BRepCheckResultHandle
+}
+
+/** Phase 19.0: BRepCheck_Analyzer::Result(subShape) returns a
+ *  Handle(BRepCheck_Result) - embind exposes it as this dereferenceable
+ *  ClassHandle wrapper, spike-confirmed via a NaN-radius sphere (Phase
+ *  15.1's own known-invalid shape): .get() reliably returned a real,
+ *  non-null BRepCheckResult for every face/edge belonging to the analyzed
+ *  shape, so this is typed non-nullable rather than speculatively guarded. */
+export interface BRepCheckResultHandle extends OcDisposable {
+  get(): BRepCheckResult
+}
+
+export interface BRepCheckResult extends OcDisposable {
+  Status(): BRepCheckStatusList
+}
+
+/** BRepCheck_ListOfStatus - spike-confirmed as a real, walkable list
+ *  (Size()/First_1()); only the first status per sub-shape is read here,
+ *  matching what the spike actually verified. */
+export interface BRepCheckStatusList extends OcDisposable {
+  Size(): number
+  First_1(): OcEnumValue
 }
 
 export interface BRepBuilderApiTransform extends OcDisposable {
@@ -219,6 +242,14 @@ export interface OpenCascadeInstance {
   BRepAlgoAPI_Common_3: new (a: TopoDsShape, b: TopoDsShape) => BRepBooleanOperation
   BRepBuilderAPI_Transform_2: new (shape: TopoDsShape, trsf: GpTrsf, copy: boolean) => BRepBuilderApiTransform
   BRepCheck_Analyzer: new (shape: TopoDsShape, geomControls: boolean) => BRepCheckAnalyzer
+  /** Phase 19.0: BRepCheck_Status - a real OCCT enum with ~37 named fault
+   *  kinds (BRepCheck_NoError=0, BRepCheck_UnorientableShape, etc.), spike-
+   *  confirmed reachable as a plain named-key object off the module (plus a
+   *  `values` key that isn't a named member) - kept as a generic index
+   *  signature rather than hand-typing every member, since consumers only
+   *  ever need a reverse value->name lookup, never to reference one member
+   *  by name. */
+  BRepCheck_Status: Record<string, OcEnumValue>
   TopExp_Explorer_2: new (shape: TopoDsShape, toFind: OcEnumValue, toAvoid: OcEnumValue) => TopExpExplorer
   TopAbs_ShapeEnum: TopAbsShapeEnumNamespace
   TopoDS: TopoDsNamespace

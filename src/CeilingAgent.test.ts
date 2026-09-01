@@ -186,6 +186,26 @@ describe('runCeilingAgent: patch mode', () => {
       CeilingAgentExhaustedError
     )
   })
+
+  test('Phase 19.0: a genuine compile-diagnostic failure carries structured code/line data ts-morph already computes, alongside details', async () => {
+    const badCandidate = 'export function f(): number { return "not a number" }'
+    const llm = new ScriptedLlmClient([badCandidate, badCandidate])
+
+    try {
+      await runCeilingAgent({ kind: 'patch', description: 'return a number' }, llm, { maxRetries: 2 })
+      expect.unreachable('expected runCeilingAgent to throw')
+    } catch (error) {
+      const exhausted = error as CeilingAgentExhaustedError
+      const failedGate = exhausted.report.history[0].failedGate
+      expect(failedGate.gate).toBe('static')
+      expect(failedGate.details).toContain('compile diagnostics')
+      expect(failedGate.structured?.kind).toBe('diagnostic-positions')
+      if (failedGate.structured?.kind === 'diagnostic-positions') {
+        expect(failedGate.structured.diagnostics.length).toBeGreaterThan(0)
+        expect(failedGate.structured.diagnostics[0]).toMatchObject({ code: 2322, line: 1 })
+      }
+    }
+  })
 })
 
 describe('verifyInstructionCandidate: extended ground truth (Phase 3)', () => {
@@ -247,6 +267,26 @@ describe('verifyInstructionCandidate: extended ground truth (Phase 3)', () => {
     const gates = await verifyInstructionCandidate('SHR RCX, RAX', 'SHR X2, X2, X0')
     expect(gates.find((g) => g.gate === 'symbolic')?.ok).toBe(false)
   })
+})
+
+describe('verifyInstructionCandidate: Phase 19.0 structured Z3 counterexample', () => {
+  test('a genuine SAT mismatch (RCX - RCX instead of RCX - RAX) carries a structured symbolic-counterexample alongside details', async () => {
+    const gates = await verifyInstructionCandidate('SUB RCX, RAX', 'SUB X2, X2, X2')
+    const symbolic = gates.find((g) => g.gate === 'symbolic')
+    expect(symbolic?.ok).toBe(false)
+    expect(symbolic?.details).toContain('SAT model')
+    expect(symbolic?.structured).toEqual({
+      kind: 'symbolic-counterexample',
+      assignments: expect.arrayContaining([expect.objectContaining({ variable: 'dst' }), expect.objectContaining({ variable: 'src' })]),
+    })
+  }, 15000)
+
+  test('a proven-equivalent candidate has no structured field - it is only for the SAT/disproof case', async () => {
+    const gates = await verifyInstructionCandidate('SUB RCX, RAX', 'SUB X2, X2, X0')
+    const symbolic = gates.find((g) => g.gate === 'symbolic')
+    expect(symbolic?.ok).toBe(true)
+    expect(symbolic?.structured).toBeUndefined()
+  }, 15000)
 })
 
 describe('verifyInstructionCandidate: Gate 1 enforces dot-notation on conditional branches (Phase 3.1)', () => {

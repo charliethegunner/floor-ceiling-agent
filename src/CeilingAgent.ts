@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { Project, SyntaxKind } from 'ts-morph'
-import { type VerificationFloor, runVerificationFloor } from './verification-floor'
+import { Project, SyntaxKind, type DiagnosticMessageChain } from 'ts-morph'
+import { type VerificationFloor, type StructuredDiagnostic, runVerificationFloor } from './verification-floor'
 import { TOPOLOGY_FLOOR, type TopologyCandidate } from './topology-floor'
 import { CLAIM_VERIFICATION_FLOOR, type ClaimCandidate } from './claim-floor'
 import { SPATIAL_VERIFICATION_FLOOR, type SpatialCandidate } from './spatial-floor'
@@ -112,6 +112,7 @@ export interface GateCheckResult {
   gate: string
   ok: boolean
   details: string
+  structured?: StructuredDiagnostic
 }
 
 export interface CeilingAttempt {
@@ -167,6 +168,14 @@ export const MAX_RETRIES_DEFAULT = 5
 // avoids rather than papers over.
 // ---------------------------------------------------------------------------
 
+// ts-morph's Diagnostic.getMessageText() can return either a plain string
+// or a DiagnosticMessageChain (chained/nested TS errors) - this collapses
+// it to just the top-level message text for the structured field, leaving
+// `details` (which already handles both via string interpolation) untouched.
+function messageTextOf(text: string | DiagnosticMessageChain): string {
+  return typeof text === 'string' ? text : text.getMessageText()
+}
+
 function verifyPatchCandidate(candidate: string): GateCheckResult[] {
   const project = new Project({ useInMemoryFileSystem: true, compilerOptions: { strict: true } })
 
@@ -179,7 +188,17 @@ function verifyPatchCandidate(candidate: string): GateCheckResult[] {
 
   const diagnostics = project.getPreEmitDiagnostics()
   if (diagnostics.length > 0) {
-    return [{ gate: 'static', ok: false, details: `compile diagnostics: ${diagnostics.map((d) => d.getMessageText()).join('; ')}` }]
+    return [
+      {
+        gate: 'static',
+        ok: false,
+        details: `compile diagnostics: ${diagnostics.map((d) => d.getMessageText()).join('; ')}`,
+        structured: {
+          kind: 'diagnostic-positions',
+          diagnostics: diagnostics.map((d) => ({ code: d.getCode(), message: messageTextOf(d.getMessageText()), line: d.getLineNumber() })),
+        },
+      },
+    ]
   }
 
   const anyUsages = file.getDescendantsOfKind(SyntaxKind.AnyKeyword)
@@ -302,12 +321,26 @@ export async function verifyBRepCandidate(candidateText: string, onGateComplete?
 // and a fast-check-driven gate's `details` would carry its own shrunk
 // counterexample the same way - buildPrompt doesn't need to know which kind
 // of gate produced the failure, only to pass its details through exactly.
+// Phase 19.0: renders a gate's optional structured field, when present,
+// alongside its prose `details` - never a replacement for it.
+function describeStructured(structured: StructuredDiagnostic): string {
+  switch (structured.kind) {
+    case 'symbolic-counterexample':
+      return structured.assignments.map((a) => `${a.variable}=${a.value}`).join(', ')
+    case 'diagnostic-positions':
+      return structured.diagnostics.map((d) => `${d.line !== undefined ? `line ${d.line}` : 'unknown line'}: TS${d.code} ${d.message}`).join('; ')
+    case 'subshape-faults':
+      return structured.faults.map((f) => `${f.shapeKind}[${f.index}]: ${f.status}`).join(', ')
+  }
+}
+
 export function buildPrompt(request: CeilingRequest, history: CeilingAttempt[]): string {
   const feedback = history
     .map(
       (a) =>
         `Attempt ${a.attempt} was rejected - gate "${a.failedGate.gate}".\n` +
         `Counterexample/details: ${a.failedGate.details}\n` +
+        (a.failedGate.structured ? `Structured: ${describeStructured(a.failedGate.structured)}\n` : '') +
         `Rejected candidate:\n${a.candidate}`
     )
     .join('\n\n')

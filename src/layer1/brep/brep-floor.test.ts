@@ -127,10 +127,26 @@ describe('BREP_VERIFICATION_FLOOR: degenerate geometry fails closed with real, c
     }
     const report = await runVerificationFloor(BREP_VERIFICATION_FLOOR, candidate)
     expect(report.ok).toBe(false)
-    expect(report.gates.find((g) => g.gate === 'structural-validity')?.ok).toBe(false)
+    const structural = report.gates.find((g) => g.gate === 'structural-validity')
+    expect(structural?.ok).toBe(false)
     const bound = report.gates.find((g) => g.gate === 'volumetric-bound')
     expect(bound?.ok).toBe(false)
     expect(bound?.details).toContain('non-finite')
+  }, 15000)
+
+  test('Phase 19.0: the invalid NaN-radius sphere carries structured, per-face BRepCheck_Analyzer fault codes, not just a pass/fail boolean', async () => {
+    const candidate: BRepCandidate = {
+      solid: { type: 'sphere', center: [0, 0, 0], radius: NaN },
+      boundingBox: { min: [-1, -1, -1], max: [1, 1, 1] },
+    }
+    const report = await runVerificationFloor(BREP_VERIFICATION_FLOOR, candidate)
+    const structural = report.gates.find((g) => g.gate === 'structural-validity')
+    expect(structural?.ok).toBe(false)
+    expect(structural?.structured?.kind).toBe('subshape-faults')
+    if (structural?.structured?.kind === 'subshape-faults') {
+      expect(structural.structured.faults.length).toBeGreaterThan(0)
+      expect(structural.structured.faults[0]).toMatchObject({ shapeKind: 'face', index: 0, status: 'BRepCheck_UnorientableShape' })
+    }
   }, 15000)
 
   test('a union with zero children is rejected with a real diagnostic', async () => {

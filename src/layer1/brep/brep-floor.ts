@@ -1,6 +1,8 @@
-import type { VerificationFloor, VerificationGate, GateOutcome } from '../../verification-floor'
+import type { VerificationFloor, VerificationGate, GateOutcome, SubShapeFaults } from '../../verification-floor'
 import { loadOpenCascade } from './oc-loader'
-import type { OpenCascadeInstance, TopoDsShape, OcDisposable } from './oc-types'
+import type { OpenCascadeInstance, TopoDsShape, OcDisposable, BRepCheckAnalyzer } from './oc-types'
+
+type SubShapeFault = SubShapeFaults['faults'][number]
 
 // A concrete VerificationFloor (src/verification-floor.ts) for solid B-Rep
 // (Boundary Representation) geometry - faces/edges/vertices bounded by
@@ -388,16 +390,58 @@ function describeError(error: unknown): string {
 // topological validity checker, not a heuristic this project invented.
 // ---------------------------------------------------------------------------
 
+// Phase 19.0: BRepCheck_Analyzer.Result(subShape) gives real, structured,
+// per-sub-shape fault data - spike-confirmed on a NaN-radius sphere (Phase
+// 15.1's own known-invalid shape), where all 3 unique faces reported
+// BRepCheck_UnorientableShape and all 3 unique edges reported
+// BRepCheck_NoError. Reuses uniqueSubShapes (the same IsSame-deduplicated
+// walker every other gate/builder here already relies on) rather than a
+// second traversal mechanism.
+function statusNameByValue(oc: OpenCascadeInstance): Map<number, string> {
+  const names = new Map<number, string>()
+  for (const key of Object.keys(oc.BRepCheck_Status)) {
+    if (key === 'values') continue
+    const value = oc.BRepCheck_Status[key]?.value
+    if (typeof value === 'number') names.set(value, key)
+  }
+  return names
+}
+
+const BRCHECK_NO_ERROR = 0
+
+function collectSubShapeFaults(oc: OpenCascadeInstance, analyzer: BRepCheckAnalyzer, shape: TopoDsShape, disposables: OcDisposable[]): SubShapeFault[] {
+  const names = statusNameByValue(oc)
+  const faults: SubShapeFault[] = []
+  for (const shapeKind of ['face', 'edge'] as const) {
+    const subShapes = uniqueSubShapes(oc, shape, shapeKind, disposables)
+    subShapes.forEach((subShape, index) => {
+      const result = track(disposables, analyzer.Result(subShape)).get()
+      const status = track(disposables, result.Status())
+      if (status.Size() === 0) return
+      const value = status.First_1().value
+      if (value === undefined || value === BRCHECK_NO_ERROR) return
+      faults.push({ shapeKind, index, status: names.get(value) ?? `BRepCheck_Status(${value})` })
+    })
+  }
+  return faults
+}
+
 async function checkStructuralValidity(candidate: BRepCandidate): Promise<GateOutcome<'structural-validity'>> {
   const oc = await loadOpenCascade()
   const disposables: OcDisposable[] = []
   try {
     const shape = buildShape(oc, candidate.solid, disposables)
     const analyzer = track(disposables, new oc.BRepCheck_Analyzer(shape, true))
-    const valid = analyzer.IsValid_2()
-    return valid
-      ? { gate: 'structural-validity', ok: true, details: 'BRepCheck_Analyzer reports the constructed solid is topologically valid' }
-      : { gate: 'structural-validity', ok: false, details: 'BRepCheck_Analyzer reports the constructed solid is topologically INVALID (inconsistent orientation, open wires, or degenerate edges)' }
+    if (analyzer.IsValid_2()) {
+      return { gate: 'structural-validity', ok: true, details: 'BRepCheck_Analyzer reports the constructed solid is topologically valid' }
+    }
+    const faults = collectSubShapeFaults(oc, analyzer, shape, disposables)
+    return {
+      gate: 'structural-validity',
+      ok: false,
+      details: 'BRepCheck_Analyzer reports the constructed solid is topologically INVALID (inconsistent orientation, open wires, or degenerate edges)',
+      structured: { kind: 'subshape-faults', faults },
+    }
   } catch (error) {
     return { gate: 'structural-validity', ok: false, details: `shape construction failed: ${describeError(error)}` }
   } finally {

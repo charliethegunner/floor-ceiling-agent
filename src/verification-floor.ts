@@ -12,10 +12,34 @@
 // - keeps its exact literal gate-name union through runVerificationFloor,
 // rather than every caller needing an `as` cast back to it.
 
+// Phase 19.0: optional, additive structured diagnostic data - populated only
+// where a gate already computes real structured data internally (Z3's
+// counterexample model, ts-morph's diagnostic positions, BRepCheck_Analyzer's
+// per-sub-shape fault codes), never fabricated for gates that don't have it.
+// `details` remains the single source of truth for prose feedback; this is
+// a strictly additive companion a caller can use for its own formatting.
+export interface SymbolicCounterexample {
+  kind: 'symbolic-counterexample'
+  assignments: { variable: string; value: string }[]
+}
+
+export interface DiagnosticPositions {
+  kind: 'diagnostic-positions'
+  diagnostics: { code: number; message: string; line: number | undefined }[]
+}
+
+export interface SubShapeFaults {
+  kind: 'subshape-faults'
+  faults: { shapeKind: 'face' | 'edge'; index: number; status: string }[]
+}
+
+export type StructuredDiagnostic = SymbolicCounterexample | DiagnosticPositions | SubShapeFaults
+
 export interface GateOutcome<GateName extends string = string> {
   gate: GateName
   ok: boolean
   details: string
+  structured?: StructuredDiagnostic
 }
 
 export interface VerificationGate<Candidate, GateName extends string = string> {

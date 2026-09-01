@@ -224,14 +224,19 @@ async function checkSymbolicEquivalence(x86Instruction: string, candidate: strin
   }
 
   let counterexample: string = result
+  let assignments: { variable: string; value: string }[] | undefined
   if (result === 'sat') {
     const model = solver.model()
-    counterexample = model
-      .decls()
-      .map((d) => `${d.name()}=${model.get(d).toString()}`)
-      .join(', ')
+    const decls = model.decls()
+    assignments = decls.map((d) => ({ variable: String(d.name()), value: model.get(d).toString() }))
+    counterexample = assignments.map((a) => `${a.variable}=${a.value}`).join(', ')
   }
-  return { gate: 'symbolic', ok: false, details: `Z3 found a disagreeing case (SAT model): ${counterexample}` }
+  return {
+    gate: 'symbolic',
+    ok: false,
+    details: `Z3 found a disagreeing case (SAT model): ${counterexample}`,
+    structured: assignments ? { kind: 'symbolic-counterexample', assignments } : undefined,
+  }
 }
 
 // ARM64 register names and mnemonics are case-insensitive in real assembly
