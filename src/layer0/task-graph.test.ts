@@ -1,7 +1,10 @@
-import { describe, test, expect } from 'vitest'
+import { describe, test, expect, afterEach } from 'vitest'
 import { topologicalSort, TaskGraphExecutor, type TaskNode } from './task-graph'
 import { MetaKernelCompiler } from '../layer5/meta-kernel'
 import type { LlmClient } from '../CeilingAgent'
+import { classifyIntent } from './intent-router'
+import { BRepWorkerPoolEvaluator } from '../layer1/brep/brep-worker-pool'
+import type { BRepCandidate } from '../layer1/brep/brep-floor'
 
 function node(id: string, dependsOn?: string[]): TaskNode {
   return { id, kind: 'instruction', description: 'MOV RAX, RBX', dependsOn }
@@ -287,5 +290,106 @@ describe('TaskGraphExecutor: Phase 14.5.2 - real cross-node MetaKernelCompiler r
     // No meta-kernel at all means no bypass is even attempted - the LLM's
     // (wrong) answer is used as-is and fails real verification.
     expect(result.ok).toBe(false)
+  }, 15000)
+})
+
+// ---------------------------------------------------------------------------
+// Phase 15.1: 'brep' DAG nodes dispatch directly to BRepWorkerPoolEvaluator
+// (real worker thread, real OpenCASCADE) - never through runCeilingAgent's
+// own retry loop. Real worker_threads are spawned, so every pool created
+// here MUST be shut down or the process hangs at exit.
+// ---------------------------------------------------------------------------
+
+const pools: BRepWorkerPoolEvaluator[] = []
+function trackedBRepPool(...args: ConstructorParameters<typeof BRepWorkerPoolEvaluator>): BRepWorkerPoolEvaluator {
+  const pool = new BRepWorkerPoolEvaluator(...args)
+  pools.push(pool)
+  return pool
+}
+
+afterEach(async () => {
+  await Promise.all(pools.splice(0).map((pool) => pool.shutdown()))
+})
+
+const GOOD_BREP_CANDIDATE: BRepCandidate = {
+  solid: { type: 'box', center: [0, 0, 0], halfExtents: [5, 5, 5] },
+  boundingBox: { min: [-6, -6, -6], max: [6, 6, 6] },
+}
+
+const DEGENERATE_BREP_CANDIDATE: BRepCandidate = {
+  solid: { type: 'sphere', center: [0, 0, 0], radius: -1 },
+  boundingBox: { min: [-1, -1, -1], max: [1, 1, 1] },
+}
+
+describe('TaskGraphExecutor: Phase 15.1 - brep node dispatch to BRepWorkerPoolEvaluator', () => {
+  test('run() throws immediately, before any LLM call, when a brep node is present but no brepPool is supplied', async () => {
+    let llmCalled = false
+    const llm: LlmClient = {
+      async complete() {
+        llmCalled = true
+        return '{}'
+      },
+    }
+    const executor = new TaskGraphExecutor({ llm })
+
+    await expect(executor.run({ nodes: [{ id: 'shape', kind: 'brep', description: 'a box' }] })).rejects.toThrow(/brepPool/)
+    expect(llmCalled).toBe(false)
+  })
+
+  test('a well-formed brep node succeeds via the real BRepWorkerPoolEvaluator - real worker thread, real OpenCASCADE, real gates', async () => {
+    const llm = new OneShotLlmClient(JSON.stringify(GOOD_BREP_CANDIDATE))
+    const brepPool = trackedBRepPool({ poolSize: 1 })
+    const executor = new TaskGraphExecutor({ llm, brepPool })
+
+    const result = await executor.run({ nodes: [{ id: 'shape', kind: 'brep', description: 'a solid box centered at the origin' }] })
+
+    expect(result.ok).toBe(true)
+    const node = result.nodes[0]
+    expect(node.status).toBe('ok')
+    expect(node.status === 'ok' && node.success.gates.map((g) => g.gate)).toEqual(['structural-validity', 'volumetric-bound'])
+    expect(node.status === 'ok' && node.success.gates.every((g) => g.ok)).toBe(true)
+  }, 15000)
+
+  test('a degenerate brep candidate exhausts retries, demotes the node to failed, and skip-propagates to its dependent - never silently accepted', async () => {
+    const llm = new OneShotLlmClient(JSON.stringify(DEGENERATE_BREP_CANDIDATE))
+    const brepPool = trackedBRepPool({ poolSize: 1 })
+    const executor = new TaskGraphExecutor({ llm, brepPool })
+
+    const result = await executor.run({
+      nodes: [
+        { id: 'bad-shape', kind: 'brep', description: 'a degenerate sphere', maxRetries: 1 },
+        { id: 'dependent', kind: 'brep', description: 'a degenerate sphere', dependsOn: ['bad-shape'] },
+      ],
+    })
+
+    expect(result.ok).toBe(false)
+    const byId = Object.fromEntries(result.nodes.map((n) => [n.id, n.status]))
+    expect(byId).toEqual({ 'bad-shape': 'failed', dependent: 'skipped' })
+  }, 15000)
+
+  test('end to end: intent routing (Phase 13.4) classifies a brep-flavored request, which seeds a DAG node executed via the real worker-isolated BRepWorkerPoolEvaluator (Phase 15.0)', async () => {
+    const rawInput = 'Propose a solid CAD B-Rep box for manufacturing, centered at the origin'
+    const brepCandidateJson = JSON.stringify(GOOD_BREP_CANDIDATE)
+
+    const llm = new ScriptedByPromptLlmClient([
+      ['classifying a request', JSON.stringify({ kind: 'brep', description: 'a solid box centered at the origin', confidence: 'high' })],
+      ['B-Rep (Boundary Representation)', brepCandidateJson],
+    ])
+
+    const classification = await classifyIntent(rawInput, llm)
+    expect(classification.ok).toBe(true)
+    expect(classification.ok && classification.request.kind).toBe('brep')
+    if (!classification.ok) return // narrows for TS below; already asserted above
+
+    const brepPool = trackedBRepPool({ poolSize: 1 })
+    const executor = new TaskGraphExecutor({ llm, brepPool })
+    const result = await executor.run({
+      nodes: [{ id: 'classified-shape', kind: classification.request.kind, description: classification.request.description }],
+    })
+
+    expect(result.ok).toBe(true)
+    const node = result.nodes[0]
+    expect(node.status).toBe('ok')
+    expect(node.status === 'ok' && JSON.parse(node.success.result)).toEqual(GOOD_BREP_CANDIDATE)
   }, 15000)
 })

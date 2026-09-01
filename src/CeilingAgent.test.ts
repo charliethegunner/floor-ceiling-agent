@@ -7,6 +7,7 @@ import {
   verifyTopologyCandidate,
   verifyClaimCandidate,
   verifySpatialCandidate,
+  verifyBRepCandidate,
   buildPrompt,
   type LlmClient,
   type CeilingRequest,
@@ -15,6 +16,7 @@ import {
 import type { TopologyCandidate } from './topology-floor'
 import type { ClaimCandidate } from './claim-floor'
 import type { SpatialCandidate } from './spatial-floor'
+import type { BRepCandidate } from './layer1/brep/brep-floor'
 import { WorkerPoolEvaluator } from './layer1/worker-pool'
 import { MetaKernelCompiler, classifyFailurePattern } from './layer5/meta-kernel'
 import { EngineTracer } from './telemetry/tracer'
@@ -926,6 +928,85 @@ describe('runCeilingAgent: spatial domain routing, including Best-of-N (Phase 7)
     expect(result.gates.map((g) => g.gate)).toEqual(['continuity', 'volumetric-bound', 'self-intersection'])
     expect(JSON.parse(result.result)).toEqual(GOOD_SPATIAL_CANDIDATE)
   })
+})
+
+const GOOD_BREP_CANDIDATE: BRepCandidate = {
+  solid: { type: 'box', center: [0, 0, 0], halfExtents: [5, 5, 5] },
+  boundingBox: { min: [-6, -6, -6], max: [6, 6, 6] },
+}
+
+// Fails the structural-validity gate: OpenCASCADE rejects a zero-height box.
+const DEGENERATE_BREP_CANDIDATE: BRepCandidate = {
+  solid: { type: 'box', center: [0, 0, 0], halfExtents: [5, 5, 0] },
+  boundingBox: { min: [-6, -6, -6], max: [6, 6, 6] },
+}
+
+// Phase 15.1: 'brep' as a first-class CeilingRequestKind - the real
+// OpenCASCADE kernel runs in-process here (no worker pool involved), the
+// same "in-process by default" path every other worker-eligible domain
+// already has (see verifyBRepCandidate's own header comment in
+// CeilingAgent.ts). TaskGraphExecutor's separate, worker-isolated
+// BRepWorkerPoolEvaluator dispatch is covered in task-graph.test.ts.
+describe('verifyBRepCandidate: routes through BREP_VERIFICATION_FLOOR (Phase 15.1)', () => {
+  test('a well-formed box passes both real gates', async () => {
+    const gates = await verifyBRepCandidate(JSON.stringify(GOOD_BREP_CANDIDATE))
+    expect(gates.map((g) => g.gate)).toEqual(['structural-validity', 'volumetric-bound'])
+    expect(gates.every((g) => g.ok)).toBe(true)
+  }, 15000)
+
+  test('a degenerate (zero-height) box is caught by the structural-validity gate', async () => {
+    const gates = await verifyBRepCandidate(JSON.stringify(DEGENERATE_BREP_CANDIDATE))
+    const structural = gates.find((g) => g.gate === 'structural-validity')
+    expect(structural?.ok).toBe(false)
+    expect(structural?.details).toContain('halfExtents must all be > 0')
+  }, 15000)
+
+  test('malformed JSON is reported as a gate failure, not an uncaught exception', async () => {
+    const gates = await verifyBRepCandidate('not valid json {{{')
+    expect(gates).toHaveLength(1)
+    expect(gates[0].ok).toBe(false)
+    expect(gates[0].gate).toBe('structural-validity')
+  }, 15000)
+
+  test('a markdown-fenced candidate is parsed and verified normally (Phase 5.1 fence-stripping applies here too)', async () => {
+    const gates = await verifyBRepCandidate('```json\n' + JSON.stringify(GOOD_BREP_CANDIDATE) + '\n```')
+    expect(gates.every((g) => g.ok)).toBe(true)
+  }, 15000)
+})
+
+describe('buildPrompt: routes a brep request to JSON instructions (Phase 15.1)', () => {
+  test('a brep request asks for JSON, not ARM64 or plain TypeScript instructions', () => {
+    const prompt = buildPrompt({ kind: 'brep', description: 'a solid box' }, [])
+    expect(prompt).toContain('a solid box')
+    expect(prompt).toContain('JSON')
+    expect(prompt).toContain('B-Rep')
+    expect(prompt).not.toContain('ARM64 instruction text')
+  })
+})
+
+describe('runCeilingAgent: brep domain routing, standalone in-process (Phase 15.1)', () => {
+  test('accepts a well-formed brep candidate on the first attempt', async () => {
+    const llm = new ScriptedLlmClient([JSON.stringify(GOOD_BREP_CANDIDATE)])
+    const result = await runCeilingAgent({ kind: 'brep', description: 'a solid box centered at the origin' }, llm)
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(1)
+    expect(result.gates.map((g) => g.gate)).toEqual(['structural-validity', 'volumetric-bound'])
+  }, 15000)
+
+  test('self-corrects after a degenerate candidate and succeeds on retry', async () => {
+    const llm = new ScriptedLlmClient([JSON.stringify(DEGENERATE_BREP_CANDIDATE), JSON.stringify(GOOD_BREP_CANDIDATE)])
+    const result = await runCeilingAgent({ kind: 'brep', description: 'a solid box centered at the origin' }, llm)
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(2)
+    expect(result.history[0].failedGate.gate).toBe('structural-validity')
+  }, 15000)
+
+  test('throws CeilingAgentExhaustedError after exhausting retries on a candidate that never satisfies structural validity', async () => {
+    const llm = new ScriptedLlmClient([JSON.stringify(DEGENERATE_BREP_CANDIDATE), JSON.stringify(DEGENERATE_BREP_CANDIDATE)])
+    await expect(runCeilingAgent({ kind: 'brep', description: 'a solid box' }, llm, { maxRetries: 2 })).rejects.toThrow(CeilingAgentExhaustedError)
+  }, 15000)
 })
 
 // ---------------------------------------------------------------------------

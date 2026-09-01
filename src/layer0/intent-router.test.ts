@@ -51,6 +51,26 @@ describe('computeHeuristicSignal: pure pattern scoring, no LLM involved', () => 
     expect(signal.winner).toBe('spatial')
   })
 
+  test('a real brep-shaped request is a clear winner for "brep" (Phase 15.1)', () => {
+    const signal = computeHeuristicSignal('Propose a solid CAD B-Rep cylinder for manufacturing, exported as a watertight STEP file')
+    expect(signal.winner).toBe('brep')
+  })
+
+  test('spatial and brep vocabularies are non-overlapping for clearly domain-specific phrasing - no cross-contamination', () => {
+    const spatial = computeHeuristicSignal('Propose a sphere and a torus combined via CSG union, following SDF conventions')
+    expect(spatial.scores.brep).toBe(0)
+
+    const brep = computeHeuristicSignal('Propose a solid CAD B-Rep cylinder for manufacturing')
+    expect(brep.scores.spatial).toBe(0)
+  })
+
+  test('a request mixing one signal from each domain ("union" is spatial vocabulary, "cylinder" is brep vocabulary) ties, correctly refusing to guess between them', () => {
+    const signal = computeHeuristicSignal('a union of a cylinder and a box')
+    expect(signal.scores.spatial).toBe(1) // "union"
+    expect(signal.scores.brep).toBe(1) // "cylinder"
+    expect(signal.winner).toBeNull()
+  })
+
   test('ordinary English containing common-word "opcodes" (OR, AND, CALL) does NOT false-positive as instruction', () => {
     // The real false-positive risk this heuristic has to guard against:
     // OR/AND/CALL are common English words, not just x86 mnemonics.
@@ -192,6 +212,42 @@ describe('classifyIntent: instruction descriptions are always sanitized to bare 
 
     expect(result.ok).toBe(true)
     expect(result.ok && result.request).toEqual({ kind: 'claim', description: normalized })
+  })
+})
+
+describe('classifyIntent: brep classification (Phase 15.1)', () => {
+  test('heuristic and LLM agreeing on "brep" produces a well-formed CeilingRequest', async () => {
+    const raw = 'Propose a solid CAD B-Rep box for manufacturing'
+    const normalized = 'A solid box, watertight, for CAD manufacturing.'
+    const llm = new ScriptedLlmClient(llmJson('brep', normalized, 'high'))
+    const result = await classifyIntent(raw, llm)
+
+    expect(result.ok).toBe(true)
+    expect(result.ok && result.request).toEqual({ kind: 'brep', description: normalized })
+  })
+
+  test('a spatial-flavored request (SDF/CSG vocabulary) is never misrouted to brep, and vice versa', async () => {
+    const raw = 'Propose a sphere and a torus combined via CSG union, following SDF conventions'
+    const llm = new ScriptedLlmClient(llmJson('spatial', 'an SDF surface combining a sphere and torus', 'high'))
+    const result = await classifyIntent(raw, llm)
+
+    expect(result.ok).toBe(true)
+    expect(result.ok && result.request.kind).toBe('spatial')
+  })
+
+  test('the LLM prompt documents brep as a distinct domain from spatial', async () => {
+    const llm = new ScriptedLlmClient(llmJson('brep', 'x', 'high'))
+    await classifyIntent('a solid CAD shape', llm)
+    expect(llm.lastPrompt).toContain('"brep"')
+    expect(llm.lastPrompt).toContain('Boundary Representation')
+  })
+
+  test('a genuinely ambiguous 3D request (mixed spatial/brep vocabulary, low-confidence LLM) is reported ambiguous with both as candidates', async () => {
+    const llm = new ScriptedLlmClient(llmJson('brep', 'a shape', 'low'))
+    const result = await classifyIntent('a union of a cylinder and a box', llm)
+
+    expect(result.ok).toBe(false)
+    expect(result.ok === false && result.reason).toBe('ambiguous')
   })
 })
 

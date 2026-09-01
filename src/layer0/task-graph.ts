@@ -1,6 +1,21 @@
-import { runCeilingAgent, type CeilingRequestKind, type CeilingSuccess, type LlmClient, type BestOfNOptions } from '../CeilingAgent'
+import {
+  runCeilingAgent,
+  buildPrompt,
+  stripJsonFences,
+  CeilingAgentExhaustedError,
+  MAX_RETRIES_DEFAULT,
+  type CeilingRequestKind,
+  type CeilingRequest,
+  type CeilingAttempt,
+  type CeilingSuccess,
+  type GateCheckResult,
+  type LlmClient,
+  type BestOfNOptions,
+} from '../CeilingAgent'
 import type { MetaKernelCompiler } from '../layer5/meta-kernel'
 import { runPeerReview, type PeerReviewResult } from './peer-review'
+import type { BRepWorkerPoolEvaluator } from '../layer1/brep/brep-worker-pool'
+import type { BRepCandidate } from '../layer1/brep/brep-floor'
 
 // Phase 14.5.1: deterministic task decomposition - "deterministic" means
 // exactly what it says: the DAG's STRUCTURE (which nodes exist, which
@@ -57,6 +72,16 @@ export interface TaskGraphExecutorOptions {
    *  commentary is attached for visibility only and can never do that.
    *  Default false. */
   peerReview?: boolean
+  /** Phase 15.1: required if the graph contains any 'brep' node. BRep nodes
+   *  never go through runCeilingAgent's own retry loop or the general
+   *  bestOfN.workerPool mechanism (BRepWorkerPoolEvaluator doesn't
+   *  structurally satisfy WorkerPoolLike - see brep-worker-pool.ts) - they
+   *  have their own dedicated, worker-isolated dispatch (runBRepNode
+   *  below), deliberately so a multi-node DAG run never pays OpenCASCADE's
+   *  ~600ms/~450-500MB cost in-process. Validated up front in run(): a
+   *  graph with a 'brep' node and no pool fails immediately, before any
+   *  LLM call is made for ANY node, rather than burning real work first. */
+  brepPool?: BRepWorkerPoolEvaluator
 }
 
 export type TaskNodeResult =
@@ -106,6 +131,49 @@ export function topologicalSort(nodes: TaskNode[]): TaskNode[] {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 15.1: 'brep' node dispatch - a self-contained mirror of
+// runCeilingAgent's retry-with-feedback loop (same buildPrompt/
+// stripJsonFences helpers, same CeilingAttempt/CeilingSuccess shapes, so
+// the rest of TaskGraphExecutor's bookkeeping - completed/results/peer
+// review - is unaffected by which path produced a node's success), but
+// verifying through BRepWorkerPoolEvaluator's real, worker-isolated
+// OpenCASCADE kernel instead of an in-process floor call. Deliberately
+// NOT integrated with MetaKernelCompiler bypass/formatResponse - both are
+// real Phase 10/11 machinery scoped to runCeilingAgent's own loop, and
+// wiring brep into them (a materially different failure-pattern shape
+// from the four existing domains) is real, separate work this change
+// does not claim to do.
+// ---------------------------------------------------------------------------
+
+const BREP_FALLBACK_GATE_NAME = 'structural-validity'
+
+async function runBRepNode(description: string, llm: LlmClient, brepPool: BRepWorkerPoolEvaluator, maxRetries: number): Promise<CeilingSuccess> {
+  const request: CeilingRequest = { kind: 'brep', description }
+  const history: CeilingAttempt[] = []
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const candidateText = await llm.complete(buildPrompt(request, history))
+    let gates: GateCheckResult[]
+    try {
+      const candidate = JSON.parse(stripJsonFences(candidateText)) as BRepCandidate
+      gates = await brepPool.verify({ domain: 'brep', candidate }, async () => {
+        throw new Error('the B-Rep worker pool is unavailable - there is no in-process fallback for a DAG-dispatched brep node')
+      })
+    } catch (error) {
+      gates = [{ gate: BREP_FALLBACK_GATE_NAME, ok: false, details: `candidate could not be verified: ${error instanceof Error ? error.message : String(error)}` }]
+    }
+
+    const failedGate = gates.find((g) => !g.ok)
+    if (!failedGate) {
+      return { ok: true, result: candidateText, attempts: attempt, gates, history: [...history] }
+    }
+    history.push({ attempt, candidate: candidateText, failedGate })
+  }
+
+  throw new CeilingAgentExhaustedError({ request, attempts: maxRetries, history })
+}
+
+// ---------------------------------------------------------------------------
 // TaskGraphExecutor
 // ---------------------------------------------------------------------------
 
@@ -125,6 +193,13 @@ export class TaskGraphExecutor {
    */
   async run(graph: TaskGraph): Promise<TaskGraphResult> {
     const order = topologicalSort(graph.nodes) // validates the graph (cycles, unknown deps) up front, before any node runs
+    if (order.some((node) => node.kind === 'brep') && !this.options.brepPool) {
+      throw new Error(
+        'this task graph has one or more "brep" nodes, but no TaskGraphExecutorOptions.brepPool was supplied - ' +
+          'see BRepWorkerPoolEvaluator (src/layer1/brep/brep-worker-pool.ts)'
+      )
+    }
+
     const completed = new Map<string, CeilingSuccess>()
     const unrunnable = new Set<string>()
     const results = new Map<string, TaskNodeResult>()
@@ -153,11 +228,15 @@ export class TaskGraphExecutor {
     const description = typeof node.description === 'function' ? node.description(completed) : node.description
     const request = { kind: node.kind, description }
     try {
-      const success = await runCeilingAgent(
-        request,
-        this.options.llm,
-        { maxRetries: node.maxRetries, bestOfN: node.bestOfN, metaKernel: this.options.metaKernel, formatResponse: this.options.formatResponse }
-      )
+      const success =
+        node.kind === 'brep'
+          ? await runBRepNode(description, this.options.llm, this.options.brepPool!, node.maxRetries ?? MAX_RETRIES_DEFAULT)
+          : await runCeilingAgent(request, this.options.llm, {
+              maxRetries: node.maxRetries,
+              bestOfN: node.bestOfN,
+              metaKernel: this.options.metaKernel,
+              formatResponse: this.options.formatResponse,
+            })
 
       if (this.options.peerReview) {
         const review = await runPeerReview(request, success, { llm: this.options.llm })

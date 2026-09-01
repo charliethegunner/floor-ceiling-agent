@@ -4,6 +4,7 @@ import { type VerificationFloor, runVerificationFloor } from './verification-flo
 import { TOPOLOGY_FLOOR, type TopologyCandidate } from './topology-floor'
 import { CLAIM_VERIFICATION_FLOOR, type ClaimCandidate } from './claim-floor'
 import { SPATIAL_VERIFICATION_FLOOR, type SpatialCandidate } from './spatial-floor'
+import { BREP_VERIFICATION_FLOOR, type BRepCandidate } from './layer1/brep/brep-floor'
 import { verifyInstructionCandidate } from './instruction-floor'
 import { ParallelCandidateSampler } from './layer3/sampler'
 import type { TemperatureStrategy, WorkerOffload } from './layer3/types'
@@ -67,7 +68,7 @@ export class OpenAiCompatibleLlmClient implements LlmClient {
 // Request / result shapes
 // ---------------------------------------------------------------------------
 
-export type CeilingRequestKind = 'instruction' | 'patch' | 'topology' | 'claim' | 'spatial'
+export type CeilingRequestKind = 'instruction' | 'patch' | 'topology' | 'claim' | 'spatial' | 'brep'
 
 export interface CeilingRequest {
   kind: CeilingRequestKind
@@ -75,7 +76,8 @@ export interface CeilingRequest {
    *  'patch': a prose description of the TypeScript function to generate.
    *  'topology': a prose description of the module layout to propose.
    *  'claim': a prose description of the claim to produce and verify.
-   *  'spatial': a prose description of the SDF/CSG surface to propose. */
+   *  'spatial': a prose description of the SDF/CSG surface to propose.
+   *  'brep': a prose description of the solid B-Rep CAD geometry to propose. */
   description: string
 }
 
@@ -126,7 +128,7 @@ export class CeilingAgentExhaustedError extends Error {
   }
 }
 
-const MAX_RETRIES_DEFAULT = 5
+export const MAX_RETRIES_DEFAULT = 5
 
 // ---------------------------------------------------------------------------
 // 'patch' mode verification: the candidate is a TypeScript source snippet.
@@ -238,6 +240,28 @@ export async function verifySpatialCandidate(candidateText: string, onGateComple
   }
 }
 
+// Phase 15.1: the in-process fallback every other worker-eligible domain
+// already has (verifyTopologyCandidate/verifyClaimCandidate/
+// verifySpatialCandidate above) - used whenever runCeilingAgent is called
+// directly for kind 'brep' without going through TaskGraphExecutor's own
+// dedicated BRepWorkerPoolEvaluator dispatch (see task-graph.ts). This is a
+// real, working path, not a stub - it pays OpenCASCADE's real ~600ms/
+// ~450-500MB cost on the calling thread, same as any other one-off call
+// would; 'brep' is deliberately absent from WORKER_DOMAIN_BY_KIND below
+// because BRepWorkerPoolEvaluator doesn't structurally satisfy
+// WorkerPoolLike (its task carries a structured BRepCandidate, not
+// candidateText: string) - so bestOfN.workerPool can never route to it,
+// only TaskGraphExecutor's direct dispatch can.
+export async function verifyBRepCandidate(candidateText: string, onGateComplete?: GateCompleteHook): Promise<GateCheckResult[]> {
+  try {
+    const parsed = JSON.parse(stripJsonFences(candidateText)) as BRepCandidate
+    const report = await runVerificationFloor(BREP_VERIFICATION_FLOOR, parsed, onGateComplete)
+    return report.gates
+  } catch (error) {
+    return [{ gate: BREP_VERIFICATION_FLOOR.gates[0].name, ok: false, details: `candidate could not be verified: ${error instanceof Error ? error.message : String(error)}` }]
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Retry loop
 // ---------------------------------------------------------------------------
@@ -299,6 +323,14 @@ const PROMPT_HEADERS: Record<CeilingRequestKind, (description: string) => string
       '{ type: "union"|"intersection", children: SdfNode[] }, or { type: "subtraction", a: SdfNode, b: SdfNode } - ' +
       'no explanation, no markdown fences.',
   ],
+  brep: (description) => [
+    `Propose a solid B-Rep (Boundary Representation) CAD shape satisfying this: ${description}`,
+    'Respond with ONLY a JSON object matching the BRepCandidate shape: ' +
+      '{ solid: BRepNode, boundingBox: { min: [x,y,z], max: [x,y,z] } }, where BRepNode is one of ' +
+      '{ type: "box", center: [x,y,z], halfExtents: [x,y,z] }, { type: "cylinder", baseCenter: [x,y,z], radius, height }, ' +
+      '{ type: "sphere", center: [x,y,z], radius }, { type: "union"|"intersection", children: BRepNode[] }, or ' +
+      '{ type: "subtraction", a: BRepNode, b: BRepNode } - no explanation, no markdown fences.',
+  ],
 }
 
 // Dynamic multi-domain routing (Phase 5): each request kind maps to the
@@ -314,6 +346,7 @@ const VERIFIERS: Record<
   topology: (_request, candidate, onGateComplete) => verifyTopologyCandidate(candidate, onGateComplete),
   claim: (_request, candidate, onGateComplete) => verifyClaimCandidate(candidate, onGateComplete),
   spatial: (_request, candidate, onGateComplete) => verifySpatialCandidate(candidate, onGateComplete),
+  brep: (_request, candidate, onGateComplete) => verifyBRepCandidate(candidate, onGateComplete),
 }
 
 // ---------------------------------------------------------------------------

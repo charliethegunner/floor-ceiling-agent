@@ -47,7 +47,7 @@ import { defaultConfirm, type ExecutionMode } from '../layer1/action-floor'
 // in the first case; there isn't in the second). IntentClassification
 // below adds a `reason` discriminant to distinguish them.
 
-const ALL_KINDS: CeilingRequestKind[] = ['instruction', 'patch', 'topology', 'claim', 'spatial']
+const ALL_KINDS: CeilingRequestKind[] = ['instruction', 'patch', 'topology', 'claim', 'spatial', 'brep']
 
 export interface IntentRouterOptions {
   /** Default 'auto' - matches today's implicit (mode-less) behavior exactly. */
@@ -76,12 +76,22 @@ const INSTRUCTION_OPCODE_ALTERNATION = 'MOV|ADD|SUB|AND|OR|XOR|SHL|SHR|CMP|PUSH|
 const INSTRUCTION_LINE_PATTERN = new RegExp(`^(${INSTRUCTION_OPCODE_ALTERNATION})\\s+[A-Za-z0-9[\\],\\s+*-]+$`, 'i')
 const X86_REGISTER_PATTERN = /\b(RAX|RBX|RCX|RDX|RSP|RBP|RDI)\b/i
 
+// 'spatial' and 'brep' are BOTH "3D geometry" domains, but represent
+// materially different things (an implicit SDF surface vs. a solid B-Rep
+// CAD shape - see spatial-floor.ts's and brep-floor.ts's own header
+// comments), so their heuristic vocabularies are deliberately kept
+// non-overlapping rather than sharing generic words like "union" or "box"
+// (both are valid in either domain's real schema) - a prompt using only
+// that kind of ambiguous shared vocabulary correctly ties and falls
+// through to the LLM-confidence-gated path below, rather than the
+// heuristic guessing which one was meant.
 const HEURISTIC_PATTERNS: Record<CeilingRequestKind, RegExp[]> = {
   instruction: [INSTRUCTION_LINE_PATTERN, X86_REGISTER_PATTERN],
   patch: [/\bwrite a (typescript )?function\b/i, /\bimplement(ing)? a function\b/i, /\bexported function\b/i, /\breturns? a (number|string|boolean)\b/i],
   topology: [/\bmodule\b/i, /\bexports?\b/i, /\bimports? from\b/i, /\breachab(le|ility)\b/i, /\.tsx?\b/],
   claim: [/\bclaim\b/i, /\bassert(ion)?\b/i, /\bverify that\b/i, /\bprove that\b/i, /\bshould (return|equal)\b/i],
   spatial: [/\bsphere\b/i, /\btorus\b/i, /\b(union|intersection|subtraction)\b/i, /\bsdf\b/i, /\bcsg\b/i, /\bbounding box\b/i],
+  brep: [/\bsolid\b/i, /\bb-?rep\b/i, /\bboundary representation\b/i, /\bwatertight\b/i, /\bcad\b/i, /\bcylinder\b/i, /\bmanufactur/i, /\bstep file\b/i],
 }
 
 export interface HeuristicSignal {
@@ -150,18 +160,19 @@ export function extractBareInstruction(rawText: string): string | null {
 
 function buildClassificationPrompt(rawText: string): string {
   return [
-    'You are classifying a request into exactly one of five verification domains for an automated engineering verification system.',
+    'You are classifying a request into exactly one of six verification domains for an automated engineering verification system.',
     '',
     'Domains:',
     '- "instruction": a single x86-64 instruction to translate to ARM64 assembly (e.g. "MOV RAX, RBX").',
     '- "patch": a description of a single TypeScript function to generate.',
     '- "topology": a description of a TypeScript module/codebase layout (exports, types, cross-file reachability).',
     '- "claim": a description of a claim to verify empirically against real exported function behavior.',
-    '- "spatial": a description of a 3D signed-distance-function (SDF) / CSG solid surface (spheres, boxes, tori, boolean operations).',
+    '- "spatial": a description of a 3D signed-distance-function (SDF) / CSG implicit surface for metrology (spheres, boxes, tori, boolean operations) - NOT solid CAD modeling.',
+    '- "brep": a description of a solid B-Rep (Boundary Representation) CAD shape for manufacturing/engineering use - watertight solids (box, cylinder, sphere primitives) combined via real boolean operations (union, intersection, subtraction).',
     '',
     `Request: "${rawText}"`,
     '',
-    'Respond with ONLY a JSON object: { "kind": "instruction"|"patch"|"topology"|"claim"|"spatial", "description": "<the request, rewritten as a clear, self-contained description appropriate for that domain>", "confidence": "high"|"low" }',
+    'Respond with ONLY a JSON object: { "kind": "instruction"|"patch"|"topology"|"claim"|"spatial"|"brep", "description": "<the request, rewritten as a clear, self-contained description appropriate for that domain>", "confidence": "high"|"low" }',
     'No explanation, no markdown fences.',
   ].join('\n')
 }
