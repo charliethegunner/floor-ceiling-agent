@@ -175,6 +175,68 @@ describe('TaskGraphExecutor: real dependency-ordered execution', () => {
   }, 15000)
 })
 
+// ---------------------------------------------------------------------------
+// Phase 17.0: an explicit demonstration of a property that already held
+// (Phase 14.5.1's own concurrent-DAG-execution and skip-propagation
+// design) - added here under the vocabulary Phase 17.0 was scoped in
+// ("verified parent states retained, not re-generated, when a downstream
+// step fails and backtracks to an alternative candidate branch"), rather
+// than a new orchestration layer. completed.set(node.id, success) in
+// runNode is called exactly once per node and never revisited, so this
+// asserts the DIRECT, strong proof of that: the LLM's total call count
+// is exactly attempts(A) + attempts(B) + attempts(C) - if either verified
+// parent were ever regenerated because C failed, this count would be
+// wrong.
+// ---------------------------------------------------------------------------
+
+describe('TaskGraphExecutor: Phase 17.0 - verified parent states are retained, never re-generated, across a downstream node\'s real failure and recovery', () => {
+  test('nodes A and B pass on their first attempt; node C fails a real Z3 gate on attempt 1 and recovers on attempt 2; A and B are never re-evaluated', async () => {
+    const llm = new ScriptedByPromptLlmClient([
+      // Checked in array order - the more specific "this is a retry" needle
+      // (the previously-rejected candidate text, present only in attempt 2's
+      // feedback) must come before the generic "first attempt" needle for
+      // the same node, or the generic one would win for both attempts.
+      ['MOV X9, X9', 'ADD X0, X0, X1'], // C's retry: its own rejected candidate only appears in the retry-feedback prompt
+      ['MOV RAX, RBX', 'MOV X0, X1'], // node A - correct on the only attempt it gets
+      ['MOV RCX, RDX', 'MOV X2, X3'], // node B - correct on the only attempt it gets
+      ['ADD RAX, RBX', 'MOV X9, X9'], // C's first attempt - a real, genuinely wrong ARM64 translation (missing the 3rd operand)
+    ])
+    const executor = new TaskGraphExecutor({ llm })
+
+    const result = await executor.run({
+      nodes: [
+        { id: 'A', kind: 'instruction', description: 'MOV RAX, RBX' },
+        { id: 'B', kind: 'instruction', description: 'MOV RCX, RDX' },
+        { id: 'C', kind: 'instruction', description: 'ADD RAX, RBX', dependsOn: ['A', 'B'] },
+      ],
+    })
+
+    expect(result.ok).toBe(true)
+    const byId = Object.fromEntries(result.nodes.map((n) => [n.id, n]))
+    expect(byId.A.status).toBe('ok')
+    expect(byId.B.status).toBe('ok')
+    expect(byId.C.status).toBe('ok')
+
+    // A and B: verified on the FIRST attempt, and that's the only LLM call
+    // either of them ever gets - the direct meaning of "retained, not
+    // re-generated," regardless of what happens to C.
+    expect(byId.A.status === 'ok' && byId.A.success.attempts).toBe(1)
+    expect(byId.B.status === 'ok' && byId.B.success.attempts).toBe(1)
+
+    // C: a REAL Z3 rejection on attempt 1 (not a contrived one - "MOV X9, X9"
+    // is a genuinely incomplete translation of "ADD RAX, RBX"), then a real
+    // recovery on attempt 2 - "backtracks to an alternative candidate branch."
+    expect(byId.C.status === 'ok' && byId.C.success.attempts).toBe(2)
+    expect(byId.C.status === 'ok' && byId.C.success.history[0]?.failedGate.gate).toBe('symbolic')
+
+    // The strongest, most direct proof: exactly 4 total LLM calls across
+    // the whole run (A:1 + B:1 + C:2). If the executor had ever regenerated
+    // an already-verified parent in response to C's failure, this count
+    // would be higher than 4.
+    expect(llm.callCount).toBe(4)
+  }, 15000)
+})
+
 describe('TaskGraphExecutor: Phase 14.5.3 - real peer review wiring', () => {
   const CLAIM_JSON = JSON.stringify({
     claims: [

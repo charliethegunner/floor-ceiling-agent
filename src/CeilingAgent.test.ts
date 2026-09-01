@@ -24,11 +24,13 @@ import { EngineTracer } from './telemetry/tracer'
 
 class ScriptedLlmClient implements LlmClient {
   private index = 0
+  callCount = 0
   constructor(private readonly responses: string[]) {}
   async complete(): Promise<string> {
     const response = this.responses[this.index]
     if (response === undefined) throw new Error('ScriptedLlmClient ran out of scripted responses')
     this.index++
+    this.callCount++
     return response
   }
 }
@@ -99,6 +101,60 @@ describe('runCeilingAgent: instruction mode', () => {
       expect(exhausted.report.history[0].candidate).toBe('garbage')
       expect(exhausted.report.history[0].failedGate.gate).toBe('symbolic')
     }
+  }, 15000)
+})
+
+// Phase 17.0: a real, narrow optimization on the sequential (non-bestOfN)
+// retry loop - a byte-identical repeated candidate is deterministically
+// known to fail the same way again, so it's short-circuited rather than
+// re-run through Z3/ts-morph/OpenCASCADE for zero new information. The
+// LLM is still called every attempt (the model might yet produce
+// something different) - only the redundant VERIFICATION work is skipped.
+describe('runCeilingAgent: duplicate-candidate short-circuit (Phase 17.0)', () => {
+  test('a byte-identical repeated candidate is short-circuited with a synthetic duplicate-candidate gate, not re-verified', async () => {
+    const llm = new ScriptedLlmClient(['XOR X0, X0, X0', 'XOR X0, X0, X0', 'MOV X0, X1'])
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { maxRetries: 3 })
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(3)
+    expect(result.history[0].failedGate.gate).toBe('symbolic') // attempt 1: a REAL Z3 rejection
+    expect(result.history[1].failedGate.gate).toBe('duplicate-candidate') // attempt 2: same candidate, short-circuited
+    expect(result.history[1].failedGate.details).toContain('Duplicate candidate generated')
+  }, 15000)
+
+  test("the duplicate-candidate gate's details echo the ORIGINAL rejection, not a generic message", async () => {
+    const llm = new ScriptedLlmClient(['XOR X0, X0, X0', 'XOR X0, X0, X0', 'MOV X0, X1'])
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { maxRetries: 3 })
+
+    expect(result.history[1].failedGate.details).toContain('attempt 1')
+    expect(result.history[1].failedGate.details).toContain('symbolic')
+  }, 15000)
+
+  test('exhausting retries via a stuck LLM that keeps repeating itself still throws CeilingAgentExhaustedError, with the LLM still called every attempt', async () => {
+    const llm = new ScriptedLlmClient(['XOR X0, X0, X0', 'XOR X0, X0, X0', 'XOR X0, X0, X0', 'XOR X0, X0, X0'])
+    await expect(runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { maxRetries: 4 })).rejects.toThrow(CeilingAgentExhaustedError)
+    expect(llm.callCount).toBe(4) // the short-circuit skips re-verification, never the LLM call itself
+  }, 15000)
+
+  test('two DIFFERENT wrong candidates on consecutive attempts are each genuinely re-verified - never mistaken for duplicates of each other', async () => {
+    const llm = new ScriptedLlmClient(['XOR X0, X0, X0', 'AND X0, X0, X0', 'MOV X0, X1'])
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { maxRetries: 3 })
+
+    expect(result.ok).toBe(true)
+    expect(result.history[0].failedGate.gate).toBe('symbolic')
+    expect(result.history[1].failedGate.gate).toBe('symbolic') // NOT 'duplicate-candidate' - genuinely different candidate text
+  }, 15000)
+
+  test('a candidate matching an EARLIER (not just the immediately prior) attempt is still recognized as a duplicate', async () => {
+    // attempt 2 is genuinely different from attempt 1, but attempt 3
+    // repeats attempt 1's exact text - not just the immediately preceding one.
+    const llm = new ScriptedLlmClient(['XOR X0, X0, X0', 'AND X0, X0, X0', 'XOR X0, X0, X0', 'MOV X0, X1'])
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'MOV RAX, RBX' }, llm, { maxRetries: 4 })
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(4)
+    expect(result.history[2].failedGate.gate).toBe('duplicate-candidate')
+    expect(result.history[2].failedGate.details).toContain('attempt 1')
   }, 15000)
 })
 

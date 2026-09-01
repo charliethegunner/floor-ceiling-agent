@@ -445,6 +445,42 @@ const WORKER_DOMAIN_BY_KIND: Partial<Record<CeilingRequestKind, WorkerDomain>> =
   claim: 'claim',
 }
 
+// Phase 17.0: a real, narrow optimization - floor gates are deterministic
+// pure functions of (domain, candidate text), so if the LLM regenerates a
+// candidate byte-identical to one already in `history`, re-running the
+// SAME verification would deterministically reproduce the SAME rejection,
+// for zero new information and real wasted work (a Z3 solve, a ts-morph
+// Project, an OpenCASCADE build). Short-circuits with a synthetic
+// 'duplicate-candidate' gate instead - its `details` echoes the ORIGINAL
+// rejection, and flows back into the next prompt via the existing
+// buildPrompt/history feedback mechanism unchanged, so the model sees a
+// concrete "you already tried this" signal rather than a generic retry.
+//
+// One real, disclosed caveat: this assumes floor determinism, which is
+// true for every domain's own CONSTRUCTION logic (Z3/ts-morph/OpenCASCADE
+// all build deterministically from candidate text) - but claim-floor's
+// empirical gate calls a real, already-committed function, and if THAT
+// function is itself non-deterministic (see
+// src/layer0/__fixtures__/flaky-subject.ts's flakyDouble, built for
+// exactly this reason in Phase 14.5.3's QA reviewer), a second real call
+// could genuinely differ from the first. This is accepted as a narrow,
+// known tradeoff rather than scoping the optimization out of 'claim'
+// entirely: a claim asserting an exact value against a function that
+// isn't deterministic is already a dubious claim on its own terms.
+function findDuplicateAttempt(candidate: string, history: CeilingAttempt[]): CeilingAttempt | undefined {
+  return history.find((attempt) => attempt.candidate === candidate)
+}
+
+function describeDuplicateCandidate(priorAttempt: CeilingAttempt): GateCheckResult {
+  return {
+    gate: 'duplicate-candidate',
+    ok: false,
+    details:
+      `Duplicate candidate generated - byte-identical to attempt ${priorAttempt.attempt}, already rejected ` +
+      `(gate "${priorAttempt.failedGate.gate}"): ${priorAttempt.failedGate.details}. Not re-verified - propose something different.`,
+  }
+}
+
 async function runSingleCandidateRound(
   request: CeilingRequest,
   llm: LlmClient,
@@ -452,6 +488,10 @@ async function runSingleCandidateRound(
   onGateComplete?: GateCompleteHook
 ): Promise<{ candidate: string; gates: GateCheckResult[] }> {
   const candidate = await llm.complete(buildPrompt(request, history))
+  const priorAttempt = findDuplicateAttempt(candidate, history)
+  if (priorAttempt) {
+    return { candidate, gates: [describeDuplicateCandidate(priorAttempt)] }
+  }
   const gates = await VERIFIERS[request.kind](request, candidate, onGateComplete)
   return { candidate, gates }
 }
