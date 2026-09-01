@@ -6,6 +6,7 @@
     "test": "vitest run",
     "benchmark": "tsx scripts/benchmark-live.ts",
     "benchmark:sampler": "tsx scripts/benchmark-sampler.ts",
+    "loadtest": "tsx scripts/load-test-engine.ts",
     "translate": "tsx bin/translate.ts"
   },
   "devDependencies": {
