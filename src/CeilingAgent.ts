@@ -196,7 +196,7 @@ function verifyPatchCandidate(candidate: string): GateCheckResult[] {
 
 const JSON_FENCE_PATTERN = /```[a-zA-Z]*\r?\n([\s\S]*?)\r?\n?```/
 
-function stripJsonFences(candidateText: string): string {
+export function stripJsonFences(candidateText: string): string {
   const trimmed = candidateText.trim()
   const match = JSON_FENCE_PATTERN.exec(trimmed)
   return match ? match[1].trim() : trimmed

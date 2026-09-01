@@ -238,7 +238,7 @@ export function toAsciiStl(triangles: Triangle[]): string {
 
 const DEFAULT_MESH_RESOLUTION = 24
 
-async function defaultConfirm(message: string): Promise<boolean> {
+export async function defaultConfirm(message: string): Promise<boolean> {
   const rl = createInterface({ input: process.stdin, output: process.stdout })
   try {
     const answer = await rl.question(`${message} [y/N] `)
