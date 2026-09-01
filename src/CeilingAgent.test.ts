@@ -4,11 +4,15 @@ import {
   CeilingAgentExhaustedError,
   OpenAiCompatibleLlmClient,
   verifyInstructionCandidate,
+  verifyTopologyCandidate,
+  verifyClaimCandidate,
   buildPrompt,
   type LlmClient,
   type CeilingRequest,
   type CeilingAttempt,
 } from './CeilingAgent'
+import type { TopologyCandidate } from './topology-floor'
+import type { ClaimCandidate } from './claim-floor'
 
 class ScriptedLlmClient implements LlmClient {
   private index = 0
@@ -336,5 +340,216 @@ describe('verifyInstructionCandidate: expressed via the generic VerificationFloo
   test('still returns exactly the static/fuzz/symbolic gates, in order, after the floor-based refactor', async () => {
     const gates = await verifyInstructionCandidate('MOV RAX, RBX', 'MOV X0, X1')
     expect(gates.map((g) => g.gate)).toEqual(['static', 'fuzz', 'symbolic'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 5: dynamic multi-domain routing. CeilingRequest.kind now also
+// routes 'topology' candidates through TOPOLOGY_FLOOR and 'claim' candidates
+// through CLAIM_VERIFICATION_FLOOR (src/topology-floor.ts, src/claim-floor.ts)
+// - the same self-healing retry loop that already drives the ARM64
+// instruction floor, generalized to any VerificationFloor. The LLM's raw
+// completion is JSON text parsed into that floor's Candidate shape.
+// ---------------------------------------------------------------------------
+
+const GOOD_TOPOLOGY_CANDIDATE: TopologyCandidate = {
+  inMemoryFiles: {
+    'a.ts': "import { b } from './b'\nexport function a(): number { return b() }",
+    'b.ts': 'export function b(): number { return 42 }',
+  },
+  expectedExports: [{ filePath: 'a.ts', exportedNames: ['a'] }],
+  reachability: [{ from: { filePath: 'a.ts', functionName: 'a' }, to: { filePath: 'b.ts', functionName: 'b' }, expectReachable: true }],
+}
+
+const TOPOLOGY_CANDIDATE_WITH_MISSING_EXPORT: TopologyCandidate = {
+  inMemoryFiles: {
+    'a.ts': "import { b } from './b'\nfunction a(): number { return b() }",
+    'b.ts': 'export function b(): number { return 42 }',
+  },
+  expectedExports: [{ filePath: 'a.ts', exportedNames: ['a'] }],
+  reachability: [],
+}
+
+describe('verifyTopologyCandidate: routes through TOPOLOGY_FLOOR (Phase 5)', () => {
+  test('a well-formed candidate satisfying every expectation passes all three gates in order', async () => {
+    const gates = await verifyTopologyCandidate(JSON.stringify(GOOD_TOPOLOGY_CANDIDATE))
+    expect(gates.map((g) => g.gate)).toEqual(['exports', 'types', 'reachability'])
+    expect(gates.every((g) => g.ok)).toBe(true)
+  })
+
+  test('a candidate missing an expected export is caught by the exports gate', async () => {
+    const gates = await verifyTopologyCandidate(JSON.stringify(TOPOLOGY_CANDIDATE_WITH_MISSING_EXPORT))
+    const exportsGate = gates.find((g) => g.gate === 'exports')
+    expect(exportsGate?.ok).toBe(false)
+    expect(exportsGate?.details).toContain('expected export "a" not found')
+  })
+
+  test('malformed JSON is reported as a gate failure, not an uncaught exception', async () => {
+    const gates = await verifyTopologyCandidate('not valid json {{{')
+    expect(gates).toHaveLength(1)
+    expect(gates[0].ok).toBe(false)
+    expect(gates[0].gate).toBe('exports')
+  })
+
+  test('JSON that parses but omits required array fields does not throw', async () => {
+    const gates = await verifyTopologyCandidate(JSON.stringify({ inMemoryFiles: { 'a.ts': 'export const x = 1' } }))
+    expect(gates.some((g) => !g.ok)).toBe(true)
+  })
+})
+
+describe('runCeilingAgent: topology domain routing (Phase 5)', () => {
+  test('accepts a correct topology candidate on the first attempt', async () => {
+    const llm = new ScriptedLlmClient([JSON.stringify(GOOD_TOPOLOGY_CANDIDATE)])
+    const result = await runCeilingAgent({ kind: 'topology', description: 'a module a.ts that calls b.ts#b' }, llm)
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(1)
+    expect(result.gates.map((g) => g.gate)).toEqual(['exports', 'types', 'reachability'])
+  })
+
+  test('self-corrects after a candidate missing the expected export and succeeds on retry', async () => {
+    const llm = new ScriptedLlmClient([JSON.stringify(TOPOLOGY_CANDIDATE_WITH_MISSING_EXPORT), JSON.stringify(GOOD_TOPOLOGY_CANDIDATE)])
+    const result = await runCeilingAgent({ kind: 'topology', description: 'a module a.ts that calls b.ts#b' }, llm)
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(2)
+    expect(result.history[0].failedGate.gate).toBe('exports')
+  })
+
+  test('recovers from a malformed-JSON attempt and succeeds on retry', async () => {
+    const llm = new ScriptedLlmClient(['not valid json {{{', JSON.stringify(GOOD_TOPOLOGY_CANDIDATE)])
+    const result = await runCeilingAgent({ kind: 'topology', description: 'a module a.ts that calls b.ts#b' }, llm)
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(2)
+    expect(result.history[0].candidate).toBe('not valid json {{{')
+  })
+
+  test('throws CeilingAgentExhaustedError after exhausting retries on a candidate that never satisfies exports', async () => {
+    const llm = new ScriptedLlmClient([
+      JSON.stringify(TOPOLOGY_CANDIDATE_WITH_MISSING_EXPORT),
+      JSON.stringify(TOPOLOGY_CANDIDATE_WITH_MISSING_EXPORT),
+    ])
+
+    await expect(runCeilingAgent({ kind: 'topology', description: 'a module a.ts that calls b.ts#b' }, llm, { maxRetries: 2 })).rejects.toThrow(
+      CeilingAgentExhaustedError
+    )
+  })
+})
+
+const GOOD_CLAIM_CANDIDATE: ClaimCandidate = {
+  claims: [
+    {
+      statement: 'translateInstruction lowers MOV RAX, RBX to MOV X0, X1',
+      subject: { modulePath: 'lib/translator.ts', exportName: 'translateInstruction' },
+      assertion: { args: ['MOV RAX, RBX'], expected: { ok: true, instruction: 'MOV X0, X1' } },
+    },
+  ],
+}
+
+const FALSE_CLAIM_CANDIDATE: ClaimCandidate = {
+  claims: [
+    {
+      statement: 'translateInstruction lowers MOV RAX, RBX to MOV X1, X0',
+      subject: { modulePath: 'lib/translator.ts', exportName: 'translateInstruction' },
+      assertion: { args: ['MOV RAX, RBX'], expected: { ok: true, instruction: 'MOV X1, X0' } },
+    },
+  ],
+}
+
+const HALLUCINATED_EXPORT_CLAIM_CANDIDATE: ClaimCandidate = {
+  claims: [
+    {
+      statement: 'a claim about a function that does not exist',
+      subject: { modulePath: 'lib/translator.ts', exportName: 'thisFunctionDoesNotExist' },
+      assertion: { args: [], expected: null },
+    },
+  ],
+}
+
+describe('verifyClaimCandidate: routes through CLAIM_VERIFICATION_FLOOR (Phase 5)', () => {
+  test('a true claim about a real, committed function passes all three gates in order', async () => {
+    const gates = await verifyClaimCandidate(JSON.stringify(GOOD_CLAIM_CANDIDATE))
+    expect(gates.map((g) => g.gate)).toEqual(['structural', 'cross-reference', 'empirical'])
+    expect(gates.every((g) => g.ok)).toBe(true)
+  })
+
+  test('a false claim is caught by the empirical gate, by actually running the function', async () => {
+    const gates = await verifyClaimCandidate(JSON.stringify(FALSE_CLAIM_CANDIDATE))
+    const empirical = gates.find((g) => g.gate === 'empirical')
+    expect(empirical?.ok).toBe(false)
+    expect(empirical?.details).toContain('expected')
+  })
+
+  test('a hallucinated export name is caught by the cross-reference gate', async () => {
+    const gates = await verifyClaimCandidate(JSON.stringify(HALLUCINATED_EXPORT_CLAIM_CANDIDATE))
+    const crossReference = gates.find((g) => g.gate === 'cross-reference')
+    expect(crossReference?.ok).toBe(false)
+    expect(crossReference?.details).toContain('does not export')
+  })
+
+  test('malformed JSON is reported as a gate failure, not an uncaught exception', async () => {
+    const gates = await verifyClaimCandidate('not valid json {{{')
+    expect(gates).toHaveLength(1)
+    expect(gates[0].ok).toBe(false)
+    expect(gates[0].gate).toBe('structural')
+  })
+})
+
+describe('runCeilingAgent: claim domain routing (Phase 5)', () => {
+  test('accepts a true claim on the first attempt', async () => {
+    const llm = new ScriptedLlmClient([JSON.stringify(GOOD_CLAIM_CANDIDATE)])
+    const result = await runCeilingAgent({ kind: 'claim', description: 'MOV RAX, RBX lowers to MOV X0, X1' }, llm)
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(1)
+    expect(result.gates.map((g) => g.gate)).toEqual(['structural', 'cross-reference', 'empirical'])
+  })
+
+  test('self-corrects after a false claim and succeeds on retry', async () => {
+    const llm = new ScriptedLlmClient([JSON.stringify(FALSE_CLAIM_CANDIDATE), JSON.stringify(GOOD_CLAIM_CANDIDATE)])
+    const result = await runCeilingAgent({ kind: 'claim', description: 'MOV RAX, RBX lowers to MOV X0, X1' }, llm)
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(2)
+    expect(result.history[0].failedGate.gate).toBe('empirical')
+  })
+
+  test('throws CeilingAgentExhaustedError after exhausting retries on a hallucinated export', async () => {
+    const llm = new ScriptedLlmClient([JSON.stringify(HALLUCINATED_EXPORT_CLAIM_CANDIDATE), JSON.stringify(HALLUCINATED_EXPORT_CLAIM_CANDIDATE)])
+
+    await expect(
+      runCeilingAgent({ kind: 'claim', description: 'a claim about a function that does not exist' }, llm, { maxRetries: 2 })
+    ).rejects.toThrow(CeilingAgentExhaustedError)
+  })
+
+  test('the exhausted error history records the raw JSON candidate text verbatim', async () => {
+    const llm = new ScriptedLlmClient([JSON.stringify(HALLUCINATED_EXPORT_CLAIM_CANDIDATE)])
+
+    try {
+      await runCeilingAgent({ kind: 'claim', description: 'a claim about a function that does not exist' }, llm, { maxRetries: 1 })
+      expect.unreachable('expected runCeilingAgent to throw')
+    } catch (error) {
+      expect(error).toBeInstanceOf(CeilingAgentExhaustedError)
+      const exhausted = error as CeilingAgentExhaustedError
+      expect(exhausted.report.history[0].candidate).toBe(JSON.stringify(HALLUCINATED_EXPORT_CLAIM_CANDIDATE))
+      expect(exhausted.report.history[0].failedGate.gate).toBe('cross-reference')
+    }
+  })
+})
+
+describe('buildPrompt: routes domain-specific instructions for topology and claim kinds (Phase 5)', () => {
+  test('a topology request asks for JSON, not ARM64 or plain TypeScript instructions', () => {
+    const prompt = buildPrompt({ kind: 'topology', description: 'a module a.ts that calls b.ts#b' }, [])
+    expect(prompt).toContain('a module a.ts that calls b.ts#b')
+    expect(prompt).toContain('JSON')
+    expect(prompt).not.toContain('ARM64 instruction text')
+  })
+
+  test('a claim request asks for JSON, not ARM64 or plain TypeScript instructions', () => {
+    const prompt = buildPrompt({ kind: 'claim', description: 'MOV RAX, RBX lowers to MOV X0, X1' }, [])
+    expect(prompt).toContain('MOV RAX, RBX lowers to MOV X0, X1')
+    expect(prompt).toContain('JSON')
+    expect(prompt).not.toContain('ARM64 instruction text')
   })
 })

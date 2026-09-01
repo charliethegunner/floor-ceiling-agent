@@ -1,7 +1,9 @@
 import { Project, SyntaxKind } from 'ts-morph'
 import { X86Register, registerMap, parseInstruction, JCC_CONDITIONS } from '../lib/translator'
 import { getZ3, checkPushEquivalence, checkPopEquivalence, checkMemoryEquivalence } from './FloorEngine'
-import { type VerificationFloor, runVerificationFloor } from './verification-floor'
+import { type VerificationFloor, type GateOutcome, runVerificationFloor } from './verification-floor'
+import { TOPOLOGY_FLOOR, type TopologyCandidate } from './topology-floor'
+import { CLAIM_VERIFICATION_FLOOR, type ClaimCandidate } from './claim-floor'
 
 // ---------------------------------------------------------------------------
 // LLM client. A local Ollama or vLLM server both expose an OpenAI-compatible
@@ -55,17 +57,19 @@ export class OpenAiCompatibleLlmClient implements LlmClient {
 // Request / result shapes
 // ---------------------------------------------------------------------------
 
-export type CeilingRequestKind = 'instruction' | 'patch'
+export type CeilingRequestKind = 'instruction' | 'patch' | 'topology' | 'claim'
 
 export interface CeilingRequest {
   kind: CeilingRequestKind
   /** 'instruction': the x86 instruction text to translate.
-   *  'patch': a prose description of the TypeScript function to generate. */
+   *  'patch': a prose description of the TypeScript function to generate.
+   *  'topology': a prose description of the module layout to propose.
+   *  'claim': a prose description of the claim to produce and verify. */
   description: string
 }
 
 export interface GateCheckResult {
-  gate: 'static' | 'fuzz' | 'symbolic'
+  gate: string
   ok: boolean
   details: string
 }
@@ -157,7 +161,7 @@ function parseArm64Line(line: string): { opcode: string; operands: string[] } {
   }
 }
 
-function checkRegisterTokenValidity(candidate: string): GateCheckResult {
+function checkRegisterTokenValidity(candidate: string): GateOutcome<'fuzz'> {
   const tokens = extractRegisterTokens(candidate)
   const invalid = [...new Set(tokens.filter((t) => !ARM64_REGISTERS.has(t)))]
   if (invalid.length > 0) {
@@ -166,7 +170,7 @@ function checkRegisterTokenValidity(candidate: string): GateCheckResult {
   return { gate: 'fuzz', ok: true, details: `all ${tokens.length} register token(s) are valid ARM64 registers` }
 }
 
-async function checkSymbolicEquivalence(x86Instruction: string, candidate: string): Promise<GateCheckResult> {
+async function checkSymbolicEquivalence(x86Instruction: string, candidate: string): Promise<GateOutcome<'symbolic'>> {
   const parsedX86 = parseInstruction(x86Instruction)
   if (!parsedX86) {
     return { gate: 'symbolic', ok: false, details: `cannot verify "${x86Instruction}": could not parse instruction` }
@@ -178,13 +182,13 @@ async function checkSymbolicEquivalence(x86Instruction: string, candidate: strin
   // tested exactly these proofs (Phase 1, Phase 1b), so they're reused here
   // via their candidateOverride parameter rather than re-derived.
   if (parsedX86.opcode === 'PUSH' && parsedX86.operands.length === 1) {
-    return checkPushEquivalence(x86Instruction, candidate)
+    return { ...(await checkPushEquivalence(x86Instruction, candidate)), gate: 'symbolic' }
   }
   if (parsedX86.opcode === 'POP' && parsedX86.operands.length === 1) {
-    return checkPopEquivalence(x86Instruction, candidate)
+    return { ...(await checkPopEquivalence(x86Instruction, candidate)), gate: 'symbolic' }
   }
   if (parsedX86.opcode === 'MOV' && parsedX86.operands.length === 2 && parsedX86.operands.some((op) => op.startsWith('['))) {
-    return checkMemoryEquivalence(x86Instruction, candidate)
+    return { ...(await checkMemoryEquivalence(x86Instruction, candidate)), gate: 'symbolic' }
   }
 
   // Opcode-lookup must happen BEFORE the arity check: JMP/Jcc/CALL/RET are
@@ -330,7 +334,7 @@ async function checkSymbolicEquivalence(x86Instruction: string, candidate: strin
 // model produced it, so reports show what the model actually said.
 const CONDITION_CODES = Object.values(JCC_CONDITIONS)
 
-function checkStaticShape(candidate: string): GateCheckResult {
+function checkStaticShape(candidate: string): GateOutcome<'static'> {
   const lines = candidate
     .split('\n')
     .map((l) => l.trim())
@@ -429,6 +433,38 @@ function verifyPatchCandidate(candidate: string): GateCheckResult[] {
 }
 
 // ---------------------------------------------------------------------------
+// 'topology' and 'claim' mode verification: the candidate is JSON text
+// parsed into TOPOLOGY_FLOOR's / CLAIM_VERIFICATION_FLOOR's Candidate shape
+// (src/topology-floor.ts, src/claim-floor.ts) and run through that floor
+// unchanged - this is the generic VerificationFloor contract (Phase 4)
+// driving domains beyond ARM64 instruction translation. Malformed JSON, or
+// JSON missing a required array field, is caught here and reported as a
+// failure of that floor's first gate, matching verifyPatchCandidate's
+// "unparseable candidate fails the first gate" precedent - never left as an
+// uncaught exception that would break the retry loop.
+// ---------------------------------------------------------------------------
+
+export async function verifyTopologyCandidate(candidateText: string): Promise<GateCheckResult[]> {
+  try {
+    const parsed = JSON.parse(candidateText) as TopologyCandidate
+    const report = await runVerificationFloor(TOPOLOGY_FLOOR, parsed)
+    return report.gates
+  } catch (error) {
+    return [{ gate: TOPOLOGY_FLOOR.gates[0].name, ok: false, details: `candidate could not be verified: ${error instanceof Error ? error.message : String(error)}` }]
+  }
+}
+
+export async function verifyClaimCandidate(candidateText: string): Promise<GateCheckResult[]> {
+  try {
+    const parsed = JSON.parse(candidateText) as ClaimCandidate
+    const report = await runVerificationFloor(CLAIM_VERIFICATION_FLOOR, parsed)
+    return report.gates
+  } catch (error) {
+    return [{ gate: CLAIM_VERIFICATION_FLOOR.gates[0].name, ok: false, details: `candidate could not be verified: ${error instanceof Error ? error.message : String(error)}` }]
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Retry loop
 // ---------------------------------------------------------------------------
 
@@ -451,20 +487,46 @@ export function buildPrompt(request: CeilingRequest, history: CeilingAttempt[]):
     )
     .join('\n\n')
 
-  const header =
-    request.kind === 'instruction'
-      ? [
-          'Translate this single x86-64 instruction to ARM64 assembly.',
-          `x86 instruction: ${request.description}`,
-          'Register mapping: RAX=X0, RBX=X1, RCX=X2, RDX=X3, RSP=SP, RBP=FP, RDI=X4.',
-          'Respond with ONLY the ARM64 instruction text - no explanation, no markdown fences.',
-        ]
-      : [
-          `Write a single exported TypeScript function implementing this: ${request.description}`,
-          'Follow strict TypeScript (no "any"). Respond with ONLY the code - no explanation, no markdown fences.',
-        ]
+  const header = PROMPT_HEADERS[request.kind](request.description)
 
   return feedback ? [...header, '', 'Previous attempts were rejected:', feedback, 'Fix the issue and try again.'].join('\n') : header.join('\n')
+}
+
+const PROMPT_HEADERS: Record<CeilingRequestKind, (description: string) => string[]> = {
+  instruction: (description) => [
+    'Translate this single x86-64 instruction to ARM64 assembly.',
+    `x86 instruction: ${description}`,
+    'Register mapping: RAX=X0, RBX=X1, RCX=X2, RDX=X3, RSP=SP, RBP=FP, RDI=X4.',
+    'Respond with ONLY the ARM64 instruction text - no explanation, no markdown fences.',
+  ],
+  patch: (description) => [
+    `Write a single exported TypeScript function implementing this: ${description}`,
+    'Follow strict TypeScript (no "any"). Respond with ONLY the code - no explanation, no markdown fences.',
+  ],
+  topology: (description) => [
+    `Propose a small TypeScript module layout satisfying this: ${description}`,
+    'Respond with ONLY a JSON object matching the TopologyCandidate shape: ' +
+      '{ inMemoryFiles: Record<filePath, sourceText>, expectedExports: [{ filePath, exportedNames }], ' +
+      'reachability: [{ from: { filePath, functionName }, to: { filePath, functionName }, expectReachable }] } - ' +
+      'no explanation, no markdown fences.',
+  ],
+  claim: (description) => [
+    `Produce a claim verification payload for this: ${description}`,
+    'Respond with ONLY a JSON object matching the ClaimCandidate shape: ' +
+      '{ claims: [{ statement, subject: { modulePath, exportName }, assertion: { args, expected } }] } - ' +
+      'no explanation, no markdown fences.',
+  ],
+}
+
+// Dynamic multi-domain routing (Phase 5): each request kind maps to the
+// verifier for its VerificationFloor, so runCeilingAgent's retry loop stays
+// domain-agnostic - adding a new floor means adding one entry here, not a
+// new branch in the loop itself.
+const VERIFIERS: Record<CeilingRequestKind, (request: CeilingRequest, candidate: string) => Promise<GateCheckResult[]> | GateCheckResult[]> = {
+  instruction: (request, candidate) => verifyInstructionCandidate(request.description, candidate),
+  patch: (_request, candidate) => verifyPatchCandidate(candidate),
+  topology: (_request, candidate) => verifyTopologyCandidate(candidate),
+  claim: (_request, candidate) => verifyClaimCandidate(candidate),
 }
 
 export async function runCeilingAgent(request: CeilingRequest, llm: LlmClient, options: { maxRetries?: number } = {}): Promise<CeilingSuccess> {
@@ -473,7 +535,7 @@ export async function runCeilingAgent(request: CeilingRequest, llm: LlmClient, o
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     const candidate = await llm.complete(buildPrompt(request, history))
-    const gates = request.kind === 'instruction' ? await verifyInstructionCandidate(request.description, candidate) : verifyPatchCandidate(candidate)
+    const gates = await VERIFIERS[request.kind](request, candidate)
 
     const failedGate = gates.find((g) => !g.ok)
     if (!failedGate) {
