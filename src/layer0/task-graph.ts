@@ -60,6 +60,18 @@ export interface TaskGraph {
 
 export interface TaskGraphExecutorOptions {
   llm: LlmClient
+  /** Phase 18.0: called after EVERY node settles (ok, failed, or skipped),
+   *  before the executor decides what's ready to run next - the caller's
+   *  one chance per node to inspect the real result and call
+   *  injectNodes() to extend the graph, so newly added nodes participate
+   *  in the SAME run rather than needing a separate one. Callbacks run
+   *  sequentially (never concurrently with each other), so two callbacks
+   *  in the same ready-batch never race to mutate the graph - the second
+   *  one sees whatever the first already injected. injectNodes() itself
+   *  is deliberately caller-driven, never invoked by this file - the
+   *  executor never decides on its own what to inject (see
+   *  topologicalSort's own header comment on why that boundary matters). */
+  onNodeSettled?: (result: TaskNodeResult, completed: ReadonlyMap<string, CeilingSuccess>) => void | Promise<void>
   /** Shared across every node in a run - the real Phase 14.5.2 wiring. Omit for a run with no cross-node rule learning/reuse at all. */
   metaKernel?: MetaKernelCompiler
   /** Threaded into every node's runCeilingAgent call, so each result's `formatted.summary.resolvedLayer` can prove whether a meta-kernel bypass genuinely fired for that node. Default false, matching runCeilingAgent's own default. */
@@ -101,6 +113,17 @@ export interface TaskGraphResult {
 // unit-tested. Real cycle/unknown-dependency detection, never silently
 // dropped or guessed at.
 // ---------------------------------------------------------------------------
+
+/** Phase 18.0: thrown specifically for a genuine cycle detected while
+ *  injecting nodes into an already-running graph (never for the OTHER
+ *  real failure topologicalSort can report - an unknown dependency id -
+ *  which stays a plain Error, so this name means exactly what it says). */
+export class CycleDetectedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'CycleDetectedError'
+  }
+}
 
 export function topologicalSort(nodes: TaskNode[]): TaskNode[] {
   const byId = new Map(nodes.map((node) => [node.id, node]))
@@ -177,7 +200,27 @@ async function runBRepNode(description: string, llm: LlmClient, brepPool: BRepWo
 // TaskGraphExecutor
 // ---------------------------------------------------------------------------
 
+interface ActiveRunState {
+  order: TaskNode[]
+  byId: Map<string, TaskNode>
+  completed: Map<string, CeilingSuccess>
+  unrunnable: Set<string>
+  results: Map<string, TaskNodeResult>
+  remaining: Set<string>
+}
+
+function requireBRepPoolIfNeeded(nodes: readonly TaskNode[], brepPool: BRepWorkerPoolEvaluator | undefined): void {
+  if (nodes.some((node) => node.kind === 'brep') && !brepPool) {
+    throw new Error(
+      'this task graph has one or more "brep" nodes, but no TaskGraphExecutorOptions.brepPool was supplied - ' +
+        'see BRepWorkerPoolEvaluator (src/layer1/brep/brep-worker-pool.ts)'
+    )
+  }
+}
+
 export class TaskGraphExecutor {
+  private activeRun: ActiveRunState | null = null
+
   constructor(private readonly options: TaskGraphExecutorOptions) {}
 
   /**
@@ -190,32 +233,118 @@ export class TaskGraphExecutor {
    * A node whose dependency failed or was skipped is itself marked
    * skipped, never attempted - failure propagates down the graph, it
    * never silently proceeds with missing upstream data.
+   *
+   * Phase 18.0: the run's live state (order/completed/remaining/etc.) is
+   * held on `this.activeRun` for the duration of this call specifically so
+   * injectNodes() - called from an onNodeSettled callback, or from
+   * anywhere else while this run is in flight - can extend it. Only one
+   * run() may be active on a given executor instance at a time; a second,
+   * concurrent run() on the SAME instance would mean two callers racing
+   * to inject into the same graph, which has no well-defined meaning.
    */
   async run(graph: TaskGraph): Promise<TaskGraphResult> {
+    if (this.activeRun) {
+      throw new Error('this TaskGraphExecutor already has a run() in progress - use a separate instance for a concurrent run')
+    }
+
     const order = topologicalSort(graph.nodes) // validates the graph (cycles, unknown deps) up front, before any node runs
-    if (order.some((node) => node.kind === 'brep') && !this.options.brepPool) {
-      throw new Error(
-        'this task graph has one or more "brep" nodes, but no TaskGraphExecutorOptions.brepPool was supplied - ' +
-          'see BRepWorkerPoolEvaluator (src/layer1/brep/brep-worker-pool.ts)'
-      )
+    requireBRepPoolIfNeeded(order, this.options.brepPool)
+
+    this.activeRun = {
+      order,
+      byId: new Map(order.map((node) => [node.id, node])),
+      completed: new Map<string, CeilingSuccess>(),
+      unrunnable: new Set<string>(),
+      results: new Map<string, TaskNodeResult>(),
+      remaining: new Set(order.map((node) => node.id)),
     }
 
-    const completed = new Map<string, CeilingSuccess>()
-    const unrunnable = new Set<string>()
-    const results = new Map<string, TaskNodeResult>()
-    const remaining = new Set(order.map((node) => node.id))
+    try {
+      while (this.activeRun.remaining.size > 0) {
+        const state = this.activeRun
+        const ready = state.order.filter((node) => state.remaining.has(node.id) && (node.dependsOn ?? []).every((dep) => !state.remaining.has(dep)))
+        // `ready` is guaranteed non-empty here: topologicalSort already
+        // proved the graph is acyclic (both the original graph and every
+        // injectNodes() extension re-validate this the same way), so at
+        // least one remaining node's dependencies are all already
+        // resolved (completed or unrunnable).
+        await Promise.all(ready.map((node) => this.runNode(node, state.completed, state.unrunnable, state.results)))
+        for (const node of ready) state.remaining.delete(node.id)
 
-    while (remaining.size > 0) {
-      const ready = order.filter((node) => remaining.has(node.id) && (node.dependsOn ?? []).every((dep) => !remaining.has(dep)))
-      // `ready` is guaranteed non-empty here: topologicalSort already
-      // proved the graph is acyclic, so at least one remaining node's
-      // dependencies are all already resolved (completed or unrunnable).
-      await Promise.all(ready.map((node) => this.runNode(node, completed, unrunnable, results)))
-      for (const node of ready) remaining.delete(node.id)
+        if (this.options.onNodeSettled) {
+          // Sequential, deliberately - see this option's own doc comment
+          // for why two callbacks in the same batch must never race.
+          for (const node of ready) {
+            await this.options.onNodeSettled(state.results.get(node.id)!, state.completed)
+          }
+        }
+      }
+
+      const finalState = this.activeRun
+      const orderedResults = finalState.order.map((node) => finalState.results.get(node.id)!)
+      return { ok: orderedResults.every((r) => r.status === 'ok'), nodes: orderedResults }
+    } finally {
+      this.activeRun = null
+    }
+  }
+
+  /**
+   * Extends the CURRENTLY RUNNING graph with new nodes - only valid while
+   * a run() is in flight (typically called from an onNodeSettled
+   * callback). Purely caller-driven: the new nodes' kind/description/
+   * dependencies come entirely from the caller, never invented by this
+   * method or by anything it calls - the same deterministic-structure
+   * boundary the rest of this file holds (see topologicalSort's header
+   * comment). `dependencies` is an additive convenience - it APPENDS extra
+   * dependency ids onto whatever a node's own `dependsOn` already lists,
+   * for wiring a reusable node definition onto a specific already-running
+   * graph without having to bake the dependency into the node object
+   * itself.
+   *
+   * Re-validates the WHOLE expanded graph (cycles, unknown deps) before
+   * committing anything - an invalid injection throws and leaves the live
+   * run's state completely untouched, never partially applied.
+   */
+  injectNodes(newNodes: TaskNode[], dependencies?: Map<string, string[]>): void {
+    const state = this.activeRun
+    if (!state) {
+      throw new Error('injectNodes() can only be called while a run() is in progress - there is no active graph to extend')
+    }
+    if (newNodes.length === 0) return
+
+    for (const node of newNodes) {
+      if (state.byId.has(node.id)) {
+        throw new Error(`injectNodes: a node with id "${node.id}" already exists in this run`)
+      }
     }
 
-    const orderedResults = order.map((node) => results.get(node.id)!)
-    return { ok: orderedResults.every((r) => r.status === 'ok'), nodes: orderedResults }
+    const nodesToInject = newNodes.map((node) => {
+      const extraDeps = dependencies?.get(node.id)
+      return extraDeps && extraDeps.length > 0 ? { ...node, dependsOn: [...(node.dependsOn ?? []), ...extraDeps] } : node
+    })
+
+    const combinedNodes = [...state.order, ...nodesToInject]
+    let newOrder: TaskNode[]
+    try {
+      newOrder = topologicalSort(combinedNodes)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      // Only a genuine cycle gets the named error - an unknown-dependency
+      // id (a different, real mistake) stays a plain Error, so
+      // CycleDetectedError never means something other than its name.
+      if (message.includes('cycle')) throw new CycleDetectedError(message)
+      throw error
+    }
+
+    requireBRepPoolIfNeeded(nodesToInject, this.options.brepPool)
+
+    // Nothing above mutated `state` - only commit once every check passed,
+    // so a rejected injection leaves the live run exactly as it was.
+    state.order = newOrder
+    for (const node of nodesToInject) {
+      state.byId.set(node.id, node)
+      state.remaining.add(node.id)
+    }
   }
 
   private async runNode(node: TaskNode, completed: Map<string, CeilingSuccess>, unrunnable: Set<string>, results: Map<string, TaskNodeResult>): Promise<void> {

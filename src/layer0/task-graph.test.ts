@@ -1,5 +1,5 @@
 import { describe, test, expect, afterEach } from 'vitest'
-import { topologicalSort, TaskGraphExecutor, type TaskNode } from './task-graph'
+import { topologicalSort, TaskGraphExecutor, CycleDetectedError, type TaskNode, type TaskNodeResult } from './task-graph'
 import { MetaKernelCompiler } from '../layer5/meta-kernel'
 import type { LlmClient } from '../CeilingAgent'
 import { classifyIntent } from './intent-router'
@@ -453,5 +453,204 @@ describe('TaskGraphExecutor: Phase 15.1 - brep node dispatch to BRepWorkerPoolEv
     const node = result.nodes[0]
     expect(node.status).toBe('ok')
     expect(node.status === 'ok' && JSON.parse(node.success.result)).toEqual(GOOD_BREP_CANDIDATE)
+  }, 15000)
+})
+
+// ---------------------------------------------------------------------------
+// Phase 18.0: caller-driven runtime node injection. injectNodes() is
+// deliberately never called from anywhere in task-graph.ts itself - only
+// from a caller-supplied onNodeSettled callback, or elsewhere in caller
+// code while a run() is in flight. The system never decides on its own
+// what to inject; that boundary is the whole point (see topologicalSort's
+// own header comment, and injectNodes' own doc comment on why).
+// ---------------------------------------------------------------------------
+
+describe('TaskGraphExecutor: Phase 18.0 - caller-driven node injection', () => {
+  test('a caller inspecting a real, genuine failure via onNodeSettled injects a resolver node, which runs to completion - while the already-completed parent is never re-evaluated', async () => {
+    const llm = new ScriptedByPromptLlmClient([
+      ['MOV RAX, RBX', 'MOV X0, X1'], // node A
+      ['x86 instruction: ADD RAX, RBX', 'MOV X9, X9'], // node B - a genuinely incomplete ARM64 translation, always wrong
+      ['MOV RCX, RDX', 'MOV X2, X3'], // the injected resolver node
+    ])
+
+    const executor = new TaskGraphExecutor({
+      llm,
+      onNodeSettled: (result) => {
+        if (result.id === 'B' && result.status === 'failed') {
+          executor.injectNodes([{ id: 'B-resolver', kind: 'instruction', description: 'MOV RCX, RDX', dependsOn: ['A'] }])
+        }
+      },
+    })
+
+    const result = await executor.run({
+      nodes: [
+        { id: 'A', kind: 'instruction', description: 'MOV RAX, RBX' },
+        { id: 'B', kind: 'instruction', description: 'ADD RAX, RBX', dependsOn: ['A'], maxRetries: 1 },
+      ],
+    })
+
+    const byId = Object.fromEntries(result.nodes.map((n) => [n.id, n]))
+    expect(byId.A.status).toBe('ok')
+    expect(byId.B.status).toBe('failed')
+    expect(byId['B-resolver']).toBeDefined()
+    expect(byId['B-resolver'].status).toBe('ok')
+
+    // The already-completed parent A is never touched again - same direct
+    // proof Phase 17.0 established: exactly one LLM call for A, regardless
+    // of B's failure or the later injection.
+    expect(byId.A.status === 'ok' && byId.A.success.attempts).toBe(1)
+    expect(llm.callCount).toBe(3) // A:1 + B:1 (maxRetries:1, exhausts immediately) + B-resolver:1
+
+    // result.nodes is in topological order - the injected node appears
+    // after its real dependency A, proving the topological queue was
+    // genuinely recomputed, not just appended.
+    expect(result.nodes.findIndex((n) => n.id === 'B-resolver')).toBeGreaterThan(result.nodes.findIndex((n) => n.id === 'A'))
+  }, 15000)
+
+  test('an invalid injection (a genuine cycle among the new nodes) throws CycleDetectedError immediately, and the live run is completely unaffected - fail-closed, zero partial state', async () => {
+    const llm = new ScriptedByPromptLlmClient([['MOV RAX, RBX', 'MOV X0, X1']])
+    let caught: unknown
+    const executor = new TaskGraphExecutor({
+      llm,
+      onNodeSettled: (result) => {
+        if (result.id === 'only' && result.status === 'ok') {
+          try {
+            executor.injectNodes([
+              { id: 'X', kind: 'instruction', description: 'MOV RAX, RBX', dependsOn: ['Y'] },
+              { id: 'Y', kind: 'instruction', description: 'MOV RAX, RBX', dependsOn: ['X'] },
+            ])
+          } catch (error) {
+            caught = error
+          }
+        }
+      },
+    })
+
+    const result = await executor.run({ nodes: [{ id: 'only', kind: 'instruction', description: 'MOV RAX, RBX' }] })
+
+    expect(caught).toBeInstanceOf(CycleDetectedError)
+    expect((caught as Error).message).toContain('cycle')
+    // The run itself completes successfully - the rejected injection left
+    // no trace at all, not even a partially-applied one.
+    expect(result.ok).toBe(true)
+    expect(result.nodes.map((n) => n.id)).toEqual(['only'])
+  }, 15000)
+
+  test('injectNodes() called outside an active run() throws immediately, never silently no-ops', () => {
+    const executor = new TaskGraphExecutor({ llm: new ScriptedByPromptLlmClient([]) })
+    expect(() => executor.injectNodes([{ id: 'late', kind: 'instruction', description: 'MOV RAX, RBX' }])).toThrow(/no active graph to extend/)
+  })
+
+  test('injecting a node whose id already exists in the run throws a clear, specific diagnostic', async () => {
+    const llm = new ScriptedByPromptLlmClient([['MOV RAX, RBX', 'MOV X0, X1']])
+    let caught: unknown
+    const executor = new TaskGraphExecutor({
+      llm,
+      onNodeSettled: (result) => {
+        if (result.id === 'A' && result.status === 'ok') {
+          try {
+            executor.injectNodes([{ id: 'A', kind: 'instruction', description: 'MOV RAX, RBX' }])
+          } catch (error) {
+            caught = error
+          }
+        }
+      },
+    })
+    await executor.run({ nodes: [{ id: 'A', kind: 'instruction', description: 'MOV RAX, RBX' }] })
+    expect(caught).toBeInstanceOf(Error)
+    expect((caught as Error).message).toContain('a node with id "A" already exists')
+  }, 15000)
+
+  test('the `dependencies` parameter appends extra dependency ids onto an injected node, without needing to bake them into the node object itself', async () => {
+    const llm = new ScriptedByPromptLlmClient([
+      ['MOV RAX, RBX', 'MOV X0, X1'], // A
+      ['MOV RCX, RDX', 'MOV X2, X3'], // injected node, must wait for A
+    ])
+    let sawUpstream = ''
+    const executor = new TaskGraphExecutor({
+      llm,
+      onNodeSettled: (result) => {
+        if (result.id === 'A' && result.status === 'ok') {
+          executor.injectNodes(
+            [
+              {
+                id: 'depends-on-A-via-map',
+                kind: 'instruction',
+                description: (upstream) => {
+                  sawUpstream = upstream.get('A')?.result ?? ''
+                  return 'MOV RCX, RDX'
+                },
+              },
+            ],
+            new Map([['depends-on-A-via-map', ['A']]])
+          )
+        }
+      },
+    })
+
+    const result = await executor.run({ nodes: [{ id: 'A', kind: 'instruction', description: 'MOV RAX, RBX' }] })
+    expect(result.ok).toBe(true)
+    expect(sawUpstream).toBe('MOV X0, X1') // proves the dependency wiring via the map genuinely took effect, not just a coincidence of ordering
+  }, 15000)
+
+  test('injecting a "brep" node without a configured brepPool throws the same real, fail-closed error the initial graph already enforces', async () => {
+    const llm = new ScriptedByPromptLlmClient([['MOV RAX, RBX', 'MOV X0, X1']])
+    let caught: unknown
+    const executor = new TaskGraphExecutor({
+      llm,
+      onNodeSettled: (result) => {
+        if (result.id === 'A' && result.status === 'ok') {
+          try {
+            executor.injectNodes([{ id: 'shape', kind: 'brep', description: 'a box' }])
+          } catch (error) {
+            caught = error
+          }
+        }
+      },
+    })
+    await executor.run({ nodes: [{ id: 'A', kind: 'instruction', description: 'MOV RAX, RBX' }] })
+    expect(caught).toBeInstanceOf(Error)
+    expect((caught as Error).message).toContain('brepPool')
+  }, 15000)
+
+  test('injecting an empty array is a safe no-op', async () => {
+    const llm = new ScriptedByPromptLlmClient([['MOV RAX, RBX', 'MOV X0, X1']])
+    const executor = new TaskGraphExecutor({
+      llm,
+      onNodeSettled: (result) => {
+        if (result.id === 'A' && result.status === 'ok') {
+          expect(() => executor.injectNodes([])).not.toThrow()
+        }
+      },
+    })
+    const result = await executor.run({ nodes: [{ id: 'A', kind: 'instruction', description: 'MOV RAX, RBX' }] })
+    expect(result.ok).toBe(true)
+    expect(result.nodes).toHaveLength(1)
+  }, 15000)
+
+  test('a SECOND round of injection, triggered by the first injected node settling, composes correctly - injection is not limited to a single round per run', async () => {
+    const llm = new ScriptedByPromptLlmClient([
+      ['MOV RAX, RBX', 'MOV X0, X1'], // A
+      ['MOV RCX, RDX', 'MOV X2, X3'], // round-1 injected node
+      ['MOV RDI, RSP', 'MOV X4, SP'], // round-2 injected node
+    ])
+    const settledIds: string[] = []
+    const executor = new TaskGraphExecutor({
+      llm,
+      onNodeSettled: (result: TaskNodeResult) => {
+        settledIds.push(result.id)
+        if (result.id === 'A' && result.status === 'ok') {
+          executor.injectNodes([{ id: 'round-1', kind: 'instruction', description: 'MOV RCX, RDX' }])
+        }
+        if (result.id === 'round-1' && result.status === 'ok') {
+          executor.injectNodes([{ id: 'round-2', kind: 'instruction', description: 'MOV RDI, RSP' }])
+        }
+      },
+    })
+
+    const result = await executor.run({ nodes: [{ id: 'A', kind: 'instruction', description: 'MOV RAX, RBX' }] })
+    expect(result.ok).toBe(true)
+    expect(result.nodes.map((n) => n.id).sort()).toEqual(['A', 'round-1', 'round-2'])
+    expect(settledIds).toContain('round-2')
   }, 15000)
 })
