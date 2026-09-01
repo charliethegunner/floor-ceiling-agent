@@ -622,6 +622,61 @@ describe('runCeilingAgent: a markdown-fenced JSON response no longer wastes a re
   })
 })
 
+// ---------------------------------------------------------------------------
+// Phase 5.1: hardening the JSON sanitizer beyond an exact "the whole
+// response is one fence" match. Real models sometimes wrap the fence in
+// their own surrounding prose ("Here's the JSON:\n```json\n{...}\n```\nLet
+// me know!"), which the Phase 5 fence-stripper (anchored to the start/end
+// of the trimmed response) did not handle - it fell through to a raw
+// JSON.parse of the whole prose-plus-fence blob and failed. The sanitizer
+// now extracts the first fenced block from anywhere in the response.
+// ---------------------------------------------------------------------------
+
+describe('verifyTopologyCandidate / verifyClaimCandidate: fence extraction tolerates surrounding prose (Phase 5.1)', () => {
+  test('topology: explanatory prose before and after the fence is ignored', async () => {
+    const withProse = `Sure, here's the module:\n${fenced(JSON.stringify(GOOD_TOPOLOGY_CANDIDATE))}\nLet me know if you need changes!`
+    const gates = await verifyTopologyCandidate(withProse)
+    expect(gates.every((g) => g.ok)).toBe(true)
+  })
+
+  test('claim: explanatory prose before and after the fence is ignored', async () => {
+    const withProse = `Here is the claim:\n${fenced(JSON.stringify(GOOD_CLAIM_CANDIDATE))}\nHope that helps!`
+    const gates = await verifyClaimCandidate(withProse)
+    expect(gates.every((g) => g.ok)).toBe(true)
+  })
+})
+
+describe('verifyClaimCandidate: empirical failures carry a runtime stack trace (Phase 5.1)', () => {
+  test('a claim whose call genuinely throws includes a real V8 stack trace alongside the message', async () => {
+    const throwingClaim: ClaimCandidate = {
+      claims: [
+        {
+          statement: 'calling translateInstruction with no argument',
+          subject: { modulePath: 'lib/translator.ts', exportName: 'translateInstruction' },
+          assertion: { args: [], expected: { ok: false, error: 'anything' } },
+        },
+      ],
+    }
+
+    const gates = await verifyClaimCandidate(JSON.stringify(throwingClaim))
+    const empirical = gates.find((g) => g.gate === 'empirical')
+
+    expect(empirical?.ok).toBe(false)
+    expect(empirical?.details).toContain('lib/translator.ts#translateInstruction()')
+    expect(empirical?.details).toContain('threw')
+    expect(empirical?.details).toContain('Stack trace:')
+    expect(empirical?.details).toMatch(/\n\s*at /)
+  })
+
+  test('a wrong-value (non-throwing) empirical failure has no stack trace section - there is no exception to report', async () => {
+    const gates = await verifyClaimCandidate(JSON.stringify(FALSE_CLAIM_CANDIDATE))
+    const empirical = gates.find((g) => g.gate === 'empirical')
+
+    expect(empirical?.ok).toBe(false)
+    expect(empirical?.details).not.toContain('Stack trace:')
+  })
+})
+
 describe('buildPrompt: routes domain-specific instructions for topology and claim kinds (Phase 5)', () => {
   test('a topology request asks for JSON, not ARM64 or plain TypeScript instructions', () => {
     const prompt = buildPrompt({ kind: 'topology', description: 'a module a.ts that calls b.ts#b' }, [])

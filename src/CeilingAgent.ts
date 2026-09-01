@@ -448,12 +448,15 @@ function verifyPatchCandidate(candidate: string): GateCheckResult[] {
 // explicitly saying "no markdown fences" - every fenced attempt failed
 // JSON.parse identically, and since the model kept resubmitting the same
 // fenced text on each retry, self-correction never happened across the
-// whole retry budget. stripJsonFences removes a wrapping fence (with or
-// without a language tag) before parsing, so a fenced-but-otherwise-valid
-// candidate is accepted rather than burning every retry on formatting.
+// whole retry budget. stripJsonFences extracts the first fenced block
+// (with or without a language tag) from anywhere in the response - not
+// just when the ENTIRE response is exactly the fence - so a model's own
+// surrounding prose ("Here's the JSON:\n```json\n{...}\n```\nLet me know!")
+// doesn't defeat it either (Phase 5.1). Falls back to the raw trimmed text
+// when no fence is present, so a plain unfenced JSON response is unchanged.
 // ---------------------------------------------------------------------------
 
-const JSON_FENCE_PATTERN = /^```[a-zA-Z]*\r?\n([\s\S]*?)\r?\n?```$/
+const JSON_FENCE_PATTERN = /```[a-zA-Z]*\r?\n([\s\S]*?)\r?\n?```/
 
 function stripJsonFences(candidateText: string): string {
   const trimmed = candidateText.trim()

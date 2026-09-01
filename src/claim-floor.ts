@@ -147,7 +147,9 @@ async function checkEmpirical(candidate: ClaimCandidate): Promise<GateOutcome<'e
         failures.push(`"${claim.statement}": ${describeCall(claim)} expected ${JSON.stringify(claim.assertion.expected)}, got ${JSON.stringify(actual)}`)
       }
     } catch (error) {
-      failures.push(`"${claim.statement}": ${describeCall(claim)} threw ${error instanceof Error ? error.message : String(error)}`)
+      const message = error instanceof Error ? error.message : String(error)
+      const stackTrace = error instanceof Error && error.stack ? `\nStack trace:\n${error.stack}` : ''
+      failures.push(`"${claim.statement}": ${describeCall(claim)} threw ${message}${stackTrace}`)
     }
   }
 
