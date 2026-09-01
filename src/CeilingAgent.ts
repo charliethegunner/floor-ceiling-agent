@@ -7,7 +7,8 @@ import { SPATIAL_VERIFICATION_FLOOR, type SpatialCandidate } from './spatial-flo
 import { verifyInstructionCandidate } from './instruction-floor'
 import { ParallelCandidateSampler } from './layer3/sampler'
 import type { TemperatureStrategy, WorkerOffload } from './layer3/types'
-import type { WorkerPoolEvaluator, WorkerDomain } from './layer1/worker-pool'
+import type { WorkerDomain } from './layer1/worker-pool'
+import type { WorkerPoolLike } from './layer1/worker-pool-like'
 import { MetaKernelCompiler, classifyFailurePattern, derivePatch } from './layer5/meta-kernel'
 import type { EngineTracer } from './telemetry/tracer'
 import { formatEngineResponse, type FormattedEngineResponse, type ResolvedLayer } from './telemetry/output-formatter'
@@ -345,13 +346,18 @@ export interface BestOfNOptions {
   baseTemperature?: number
   temperatureStrategy?: TemperatureStrategy
   /** Phase 9: verify candidates across real OS threads (WorkerPoolEvaluator,
-   *  src/layer1/worker-pool.ts) instead of in-process. The caller owns the
-   *  pool's lifecycle (create once, reuse across many runCeilingAgent calls,
-   *  shut down when done) - runCeilingAgent never spawns or closes workers
-   *  itself. Only routes 'topology'/'claim' to the pool by default (see
-   *  WORKER_DOMAIN_BY_KIND) - 'instruction'/'spatial'/'patch' always verify
-   *  in-process regardless of whether a pool is supplied. */
-  workerPool?: WorkerPoolEvaluator
+   *  src/layer1/worker-pool.ts) instead of in-process - or, since Phase
+   *  14.0, across real remote machines (DistributedWorkerPoolEvaluator,
+   *  src/layer1/distributed/distributed-worker-pool.ts). Both satisfy the
+   *  same WorkerPoolLike interface, so this widened type is the ONLY
+   *  change distribution required here - runCeilingAgent's own logic is
+   *  untouched. The caller owns the pool's lifecycle (create once, reuse
+   *  across many runCeilingAgent calls, shut down when done) -
+   *  runCeilingAgent never spawns or closes workers itself. Only routes
+   *  'topology'/'claim' to the pool by default (see WORKER_DOMAIN_BY_KIND)
+   *  - 'instruction'/'spatial'/'patch' always verify in-process regardless
+   *  of whether a pool is supplied. */
+  workerPool?: WorkerPoolLike
 }
 
 // Phase 9.1: selective per-domain routing, not "offload everything the

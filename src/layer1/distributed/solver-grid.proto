@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package solvergrid;
+
+// Phase 14.0: the entire wire contract for the Distributed Solver Pipeline.
+// LeaseTask is a real gRPC server-streaming RPC - verified directly against
+// this library's actual behavior (a real TCP bind, a real streaming push,
+// a real unary Heartbeat round-trip) before any of this was written. Each
+// call yields at most one TaskLease before the server ends the stream; a
+// solver node re-invokes LeaseTask after reporting each result. This is a
+// deliberate simplification over a fully multiplexed, persistent stream
+// (which would need flow-control logic to avoid offering a busy node a
+// second task) - one extra round-trip per task, in exchange for a much
+// simpler and more easily verified lease lifecycle.
+service SolverGrid {
+  rpc LeaseTask(NodeCapabilities) returns (stream TaskLease);
+  rpc ReportResult(TaskResult) returns (Ack);
+  rpc Heartbeat(NodeStatus) returns (Ack);
+}
+
+message NodeCapabilities {
+  string nodeId = 1;
+}
+
+message TaskLease {
+  string leaseId = 1;
+  // JSON-encoded WorkerVerifyTask (src/layer1/worker-pool-worker.ts) - kept
+  // as an opaque blob rather than mirrored field-by-field in this schema,
+  // so the wire contract never silently drifts out of sync with that
+  // TypeScript type as WorkerVerifyTask evolves.
+  string taskJson = 2;
+  // The ExecutionMode (src/layer1/action-floor.ts) this task's checkpoint
+  // is bound to - carried across the wire so a solver node, and any
+  // telemetry it emits, can observe the real autonomy mode that governed
+  // this specific dispatch, not just the coordinator's own local state.
+  string executionMode = 3;
+}
+
+message TaskResult {
+  string leaseId = 1;
+  bool ok = 2;
+  // JSON-encoded WorkerGateOutcome[] - present when ok is true.
+  string gatesJson = 3;
+  // Present when ok is false (the worker-side verify() call threw).
+  string error = 4;
+}
+
+message NodeStatus {
+  string nodeId = 1;
+  // The lease this heartbeat extends. A node may heartbeat with no active
+  // lease (general liveness); the coordinator only resets a timer when
+  // leaseId matches a currently active lease.
+  string leaseId = 2;
+}
+
+message Ack {
+  bool ok = 1;
+}

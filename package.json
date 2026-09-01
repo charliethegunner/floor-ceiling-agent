@@ -10,6 +10,8 @@
     "translate": "tsx bin/translate.ts"
   },
   "devDependencies": {
+    "@grpc/grpc-js": "^1.14.4",
+    "@grpc/proto-loader": "^0.8.1",
     "@types/node": "^26.4.0",
     "fast-check": "^4.9.0",
     "ts-morph": "^28.0.0",

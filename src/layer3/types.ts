@@ -1,5 +1,6 @@
 import type { FloorReport } from '../verification-floor'
-import type { WorkerPoolEvaluator, WorkerVerifyTask } from '../layer1/worker-pool'
+import type { WorkerVerifyTask } from '../layer1/worker-pool'
+import type { WorkerPoolLike } from '../layer1/worker-pool-like'
 
 // Layer 3 (ROADMAP.md §2/§5): Best-of-N parallel candidate sampling. These
 // types drive src/verification-floor.ts's REAL generic VerificationFloor
@@ -49,6 +50,6 @@ export interface BestOfNResult<TCandidate, GateName extends string = string> {
 // transparently falls back to the existing in-process runVerificationFloor
 // path, exactly as if no workerOffload had been configured at all.
 export interface WorkerOffload<TCandidate> {
-  pool: WorkerPoolEvaluator
+  pool: WorkerPoolLike
   toTask: (candidate: TCandidate) => WorkerVerifyTask | null
 }

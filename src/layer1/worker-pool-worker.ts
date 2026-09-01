@@ -80,7 +80,12 @@ export interface WorkerGateOutcome {
 // for process memory growth from long-running/large-project-pack work, even
 // though the number itself can't be attributed to one worker in isolation.
 
-async function verify(task: WorkerVerifyTask): Promise<WorkerGateOutcome[]> {
+// Exported (Phase 14.0) so src/layer1/distributed/solver-node.ts can run
+// the SAME, unmodified verification dispatch a local worker_thread runs -
+// only the transport differs. This is the one deliberate seam in an
+// otherwise-unchanged file; see the parentPort guard below, which is now
+// conditional rather than a hard throw for exactly this reason.
+export async function verify(task: WorkerVerifyTask): Promise<WorkerGateOutcome[]> {
   const gates: WorkerGateOutcome[] = []
   const onGateComplete = (gate: { gate: string; ok: boolean; details: string }, elapsedMs: number): void => {
     gates.push({ ...gate, elapsedMs })
@@ -125,30 +130,34 @@ interface IncomingMessage extends WorkerVerifyTask {
 
 type OutgoingMessage = { taskId: number; ok: true; gates: WorkerGateOutcome[]; rssBytes: number } | { taskId: number; ok: false; error: string; rssBytes: number }
 
-if (!parentPort) {
-  throw new Error('worker-pool-worker.ts must be run as a node:worker_threads Worker, not imported directly')
+// Phase 14.0: this file is now also imported (never as a worker_thread
+// entry point) by solver-node.ts, purely for the `verify` export above -
+// so the message-wiring below only activates when actually running as a
+// real worker_thread (parentPort set), rather than throwing on any import.
+// Behavior for the existing local-worker-pool path is byte-identical: this
+// block runs exactly when it always did.
+if (parentPort) {
+  const port = parentPort
+
+  port.on('message', (message: IncomingMessage) => {
+    if (message.__testCrash) {
+      process.exit(1)
+    }
+
+    const run = message.__testDelayMs
+      ? new Promise<void>((resolve) => setTimeout(resolve, message.__testDelayMs)).then(() => verify(message))
+      : verify(message)
+
+    const rssBytes = (): number => message.__testFakeRssBytes ?? process.memoryUsage.rss()
+
+    run
+      .then((gates) => {
+        const response: OutgoingMessage = { taskId: message.taskId, ok: true, gates, rssBytes: rssBytes() }
+        port.postMessage(response)
+      })
+      .catch((error: unknown) => {
+        const response: OutgoingMessage = { taskId: message.taskId, ok: false, error: error instanceof Error ? error.message : String(error), rssBytes: rssBytes() }
+        port.postMessage(response)
+      })
+  })
 }
-
-const port = parentPort
-
-port.on('message', (message: IncomingMessage) => {
-  if (message.__testCrash) {
-    process.exit(1)
-  }
-
-  const run = message.__testDelayMs
-    ? new Promise<void>((resolve) => setTimeout(resolve, message.__testDelayMs)).then(() => verify(message))
-    : verify(message)
-
-  const rssBytes = (): number => message.__testFakeRssBytes ?? process.memoryUsage.rss()
-
-  run
-    .then((gates) => {
-      const response: OutgoingMessage = { taskId: message.taskId, ok: true, gates, rssBytes: rssBytes() }
-      port.postMessage(response)
-    })
-    .catch((error: unknown) => {
-      const response: OutgoingMessage = { taskId: message.taskId, ok: false, error: error instanceof Error ? error.message : String(error), rssBytes: rssBytes() }
-      port.postMessage(response)
-    })
-})
