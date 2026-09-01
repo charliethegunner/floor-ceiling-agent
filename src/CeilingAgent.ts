@@ -7,6 +7,7 @@ import { verifyInstructionCandidate } from './instruction-floor'
 import { ParallelCandidateSampler } from './layer3/sampler'
 import type { TemperatureStrategy, WorkerOffload } from './layer3/types'
 import type { WorkerPoolEvaluator, WorkerDomain } from './layer1/worker-pool'
+import { MetaKernelCompiler, classifyFailurePattern, derivePatch } from './layer5/meta-kernel'
 
 export { verifyInstructionCandidate } from './instruction-floor'
 
@@ -436,21 +437,59 @@ async function runBestOfNRound(
   return { candidate, gates }
 }
 
+// Phase 10: Layer 5 Meta-Kernel (src/layer5/meta-kernel.ts) - checked before
+// each round AFTER the first (there is nothing to match on attempt 1, since
+// no failure has occurred yet). If the current failure's pattern has a
+// learned rule AND applying it produces a candidate that genuinely passes
+// real floor verification, the round resolves with zero additional LLM
+// calls. A matching rule that produces a still-failing candidate is not
+// trusted blindly - it just falls through to the normal LLM-driven round,
+// exactly as if no rule had matched; the meta-kernel can only ever save
+// work, never fabricate a false success (verification always has the final
+// say). Learning happens symmetrically: whenever a round succeeds via the
+// normal LLM path after at least one real failure, the fix that resolved it
+// is recorded so a future, different-but-same-shape failure can be
+// bypassed next time.
+async function tryMetaKernelBypass(
+  request: CeilingRequest,
+  history: CeilingAttempt[],
+  metaKernel: MetaKernelCompiler
+): Promise<{ candidate: string; gates: GateCheckResult[] } | null> {
+  if (history.length === 0) return null
+
+  const lastFailure = history[history.length - 1]
+  const pattern = classifyFailurePattern(request.kind, lastFailure.failedGate, lastFailure.candidate)
+  const patched = metaKernel.tryMatchRule(pattern, { failingCandidate: lastFailure.candidate, failedGate: lastFailure.failedGate })
+  if (patched === null) return null
+
+  const gates = await VERIFIERS[request.kind](request, patched)
+  return gates.some((g) => !g.ok) ? null : { candidate: patched, gates }
+}
+
 export async function runCeilingAgent(
   request: CeilingRequest,
   llm: LlmClient,
-  options: { maxRetries?: number; bestOfN?: BestOfNOptions } = {}
+  options: { maxRetries?: number; bestOfN?: BestOfNOptions; metaKernel?: MetaKernelCompiler } = {}
 ): Promise<CeilingSuccess> {
   const maxRetries = options.maxRetries ?? MAX_RETRIES_DEFAULT
   const history: CeilingAttempt[] = []
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const { candidate, gates } = options.bestOfN
-      ? await runBestOfNRound(request, llm, history, options.bestOfN)
-      : await runSingleCandidateRound(request, llm, history)
+    const bypass = options.metaKernel ? await tryMetaKernelBypass(request, history, options.metaKernel) : null
+
+    const { candidate, gates } = bypass
+      ? bypass
+      : options.bestOfN
+        ? await runBestOfNRound(request, llm, history, options.bestOfN)
+        : await runSingleCandidateRound(request, llm, history)
 
     const failedGate = gates.find((g) => !g.ok)
     if (!failedGate) {
+      if (!bypass && options.metaKernel && history.length > 0) {
+        const lastFailure = history[history.length - 1]
+        const pattern = classifyFailurePattern(request.kind, lastFailure.failedGate, lastFailure.candidate)
+        options.metaKernel.recordFix(pattern, derivePatch(pattern, lastFailure.candidate, candidate))
+      }
       return { ok: true, result: candidate, attempts: attempt, gates, history: [...history] }
     }
     history.push({ attempt, candidate, failedGate })

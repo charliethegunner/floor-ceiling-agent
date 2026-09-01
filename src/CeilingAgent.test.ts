@@ -16,6 +16,7 @@ import type { TopologyCandidate } from './topology-floor'
 import type { ClaimCandidate } from './claim-floor'
 import type { SpatialCandidate } from './spatial-floor'
 import { WorkerPoolEvaluator } from './layer1/worker-pool'
+import { MetaKernelCompiler, classifyFailurePattern } from './layer5/meta-kernel'
 
 class ScriptedLlmClient implements LlmClient {
   private index = 0
@@ -1055,4 +1056,93 @@ describe('runCeilingAgent: selective per-domain worker routing (Phase 9.1)', () 
     await runCeilingAgent({ kind: 'claim', description: 'MOV RAX, RBX lowers to MOV X0, X1' }, claimLlm, { bestOfN: { workerPool: pool } })
     expect(spy.callCount()).toBeGreaterThan(claimCallsBeforeClaim)
   }, 15000)
+})
+
+// ---------------------------------------------------------------------------
+// Phase 10: Layer 5 Meta-Kernel (src/layer5/meta-kernel.ts) - once a rule has
+// been LEARNED from a genuine LLM-driven self-heal, a DIFFERENT-but-same-
+// shape future failure is resolved with zero ADDITIONAL LLM calls (the very
+// first attempt of a request always still calls the LLM once - there is
+// nothing to match against before any failure has occurred). Off by default
+// (options.metaKernel undefined), so every existing test above is
+// unaffected.
+// ---------------------------------------------------------------------------
+
+class OnceOnlyLlmClient implements LlmClient {
+  private callCount = 0
+  constructor(private readonly firstResponse: string) {}
+  async complete(): Promise<string> {
+    this.callCount++
+    if (this.callCount > 1) throw new Error('the LLM should not have been called a second time - the meta-kernel should have bypassed it')
+    return this.firstResponse
+  }
+}
+
+describe('runCeilingAgent: Layer 5 Meta-Kernel zero-latency rule bypass (Phase 10)', () => {
+  test('learns a rule from a genuine LLM self-heal, then bypasses the LLM entirely for a different-but-same-shape future failure', async () => {
+    const metaKernel = new MetaKernelCompiler()
+
+    // Teaching round: the LLM gets ADD's operand order wrong once, then
+    // corrects itself normally - a genuine self-heal, no rule exists yet.
+    const teachLlm = new ScriptedLlmClient(['ADD X0, X1, X0', 'ADD X0, X0, X1'])
+    const teachResult = await runCeilingAgent({ kind: 'instruction', description: 'ADD RAX, RBX' }, teachLlm, { metaKernel })
+    expect(teachResult.ok).toBe(true)
+    expect(teachResult.attempts).toBe(2)
+    expect(metaKernel.ruleCount).toBe(1)
+
+    // Bypass round: a DIFFERENT instruction (SUB, different registers) that
+    // fails the SAME shape of mistake. Attempt 1 still needs the LLM (there
+    // is no failure yet to match against); the meta-kernel then resolves
+    // attempt 2 WITHOUT a second LLM call.
+    const bypassLlm = new OnceOnlyLlmClient('SUB X2, X0, X2') // wrong: swapped operands, same shape as the taught rule
+    const bypassResult = await runCeilingAgent({ kind: 'instruction', description: 'SUB RCX, RAX' }, bypassLlm, { metaKernel })
+
+    expect(bypassResult.ok).toBe(true)
+    expect(bypassResult.result).toBe('SUB X2, X2, X0')
+    expect(bypassResult.attempts).toBe(2)
+  }, 15000)
+
+  test('learns and applies a topology add-export rule end-to-end, with a real ts-morph fix, and zero additional LLM calls', async () => {
+    const metaKernel = new MetaKernelCompiler()
+    const badA: TopologyCandidate = { inMemoryFiles: { 'a.ts': 'function a(): number { return 1 }' }, expectedExports: [{ filePath: 'a.ts', exportedNames: ['a'] }], reachability: [] }
+    const goodA: TopologyCandidate = { inMemoryFiles: { 'a.ts': 'export function a(): number { return 1 }' }, expectedExports: [{ filePath: 'a.ts', exportedNames: ['a'] }], reachability: [] }
+    const teachLlm = new ScriptedLlmClient([JSON.stringify(badA), JSON.stringify(goodA)])
+    const teachResult = await runCeilingAgent({ kind: 'topology', description: 'a module a.ts exporting a' }, teachLlm, { metaKernel })
+    expect(teachResult.ok).toBe(true)
+    expect(metaKernel.ruleCount).toBe(1)
+
+    const badB: TopologyCandidate = { inMemoryFiles: { 'b.ts': 'function b(): number { return 2 }' }, expectedExports: [{ filePath: 'b.ts', exportedNames: ['b'] }], reachability: [] }
+    const bypassLlm = new OnceOnlyLlmClient(JSON.stringify(badB))
+    const result = await runCeilingAgent({ kind: 'topology', description: 'a module b.ts exporting b' }, bypassLlm, { metaKernel })
+
+    expect(result.ok).toBe(true)
+    const fixed = JSON.parse(result.result) as TopologyCandidate
+    expect(fixed.inMemoryFiles?.['b.ts']).toContain('export function b')
+  }, 15000)
+
+  test('a metaKernel with no matching rule does not change normal LLM-driven retry behavior', async () => {
+    const metaKernel = new MetaKernelCompiler()
+    const llm = new ScriptedLlmClient(['ADD X0, X1, X0', 'ADD X0, X0, X1'])
+    const result = await runCeilingAgent({ kind: 'instruction', description: 'ADD RAX, RBX' }, llm, { metaKernel })
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(2)
+  })
+
+  test('when a matched rule produces a candidate that still fails verification, it falls through to the normal LLM round rather than a false success', async () => {
+    const metaKernel = new MetaKernelCompiler()
+    const badCandidate = 'const x = 1' // no exported function - fails the patch domain's static gate
+    const pattern = classifyFailurePattern('patch', { gate: 'static', details: 'candidate must export at least one function' }, badCandidate)
+    metaKernel.recordFix(pattern, {
+      kind: 'exact-replacement',
+      description: 'test: an intentionally still-wrong recorded fix',
+      params: { failingCandidate: badCandidate, fixedCandidate: 'const y = 2' }, // ALSO fails - no export
+    })
+
+    const llm = new ScriptedLlmClient([badCandidate, 'export function ok(): number { return 1 }'])
+    const result = await runCeilingAgent({ kind: 'patch', description: 'return a number' }, llm, { metaKernel })
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(2)
+    expect(result.result).toBe('export function ok(): number { return 1 }')
+  })
 })
