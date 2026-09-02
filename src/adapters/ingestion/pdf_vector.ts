@@ -1,25 +1,63 @@
 import { getDocument, OPS } from 'pdfjs-dist/legacy/build/pdf.mjs'
 
-// pdfjs-dist's own .d.ts doesn't re-export `PDFOperatorList` (or type
-// `isEvalSupported` into `DocumentInitParameters`, below) from its package
-// entry point, despite both being real, documented parts of its runtime API
-// - verified directly (getOperatorList() genuinely returns this shape;
-// isEvalSupported genuinely changes behavior) rather than worked around
-// blindly. A minimal local structural type for exactly what this file reads
-// is more robust than depending on an incomplete upstream type export.
+// pdfjs-dist's own .d.ts doesn't re-export several real, documented parts of
+// its runtime API from its package entry point (PDFOperatorList,
+// isEvalSupported on DocumentInitParameters, and the shapes below) -
+// verified directly (each genuinely works/returns this shape) rather than
+// worked around blindly. Minimal local structural types for exactly what
+// this file reads are more robust than depending on an incomplete upstream
+// type export.
 interface PdfOperatorListLike {
   fnArray: number[]
   argsArray: (unknown[] | null)[]
 }
+interface PdfTextItemLike {
+  str?: string
+  /** [a, b, c, d, e, f] - already fully CTM-composed by pdfjs's own
+   *  getTextContent() (unlike getOperatorList()'s raw path coordinates,
+   *  see this file's header comment) - verified directly (a scaled/
+   *  translated text run's transform reflected the scale/translation). */
+  transform?: number[]
+}
+interface OptionalContentGroupLike {
+  id: string
+  name: string | null
+}
+interface OptionalContentConfigLike {
+  // `serializable.data` itself is genuinely `null` (not an object with an
+  // empty `groups` array) for a PDF that declares no /OCProperties at all -
+  // confirmed directly, not assumed; buildLayerNameMap below handles it.
+  serializable: { data: { groups: OptionalContentGroupLike[] | null } | null }
+}
+interface PdfPageLike {
+  getOperatorList(): Promise<PdfOperatorListLike>
+  getTextContent(): Promise<{ items: PdfTextItemLike[] }>
+}
+interface PdfDocumentLike {
+  numPages: number
+  getPage(pageNumber: number): Promise<PdfPageLike>
+  getOptionalContentConfig(): Promise<OptionalContentConfigLike>
+}
 
-// Phase 25.1: real vector-path extraction from a PDF's content stream, via
-// pdfjs-dist (not a hand-rolled parser) - this project's existing
-// src/layer1/ingestion-floor.ts explicitly declined to do this for its own
-// PDF support ("No text/content extraction is attempted - that needs real
-// stream/filter decoding... this project doesn't have"), citing exactly the
-// complexity a real library like pdfjs-dist already solves. That earlier
-// scoping decision still stands for ingestion-floor.ts itself; this is a
-// separate, additive module, not a rewrite of it.
+// Phase 25.1: real vector-path, text-node, and drawing-layer extraction
+// from a PDF, via pdfjs-dist (not a hand-rolled parser) - this project's
+// existing src/layer1/ingestion-floor.ts explicitly declined to do this for
+// its own PDF support ("No text/content extraction is attempted - that
+// needs real stream/filter decoding... this project doesn't have"), citing
+// exactly the complexity a real library like pdfjs-dist already solves.
+// That earlier scoping decision still stands for ingestion-floor.ts itself;
+// this is a separate, additive module, not a rewrite of it.
+//
+// Deliberately does NOT attempt visual scale-bar detection (graphic tick-
+// mark ruler recognition) - that is an unsolved-in-general image-analysis
+// problem this project has no validated, deterministic tool for, and
+// shipping an unreliable heuristic as "production" code would be exactly
+// the kind of theater this project's culture (real Z3 proofs, real
+// OpenCASCADE geometry, never a fabricated result) refuses elsewhere.
+// findScaleAnnotations below is a real but narrower thing: it finds TEXT
+// that states a scale ratio (e.g. "SCALE 1:50", common on AEC drawings
+// alongside a graphic bar), which is a well-posed, testable text-pattern
+// problem.
 //
 // pdfjs-dist's getOperatorList() does NOT expose separate moveTo/lineTo/
 // curveTo/closePath entries in its fnArray for a stroked/filled path - it
@@ -41,7 +79,12 @@ interface PdfOperatorListLike {
 // way (a scaled rectangle's extracted coordinates were unscaled). This
 // module therefore tracks the current transformation matrix (CTM) itself,
 // via OPS.save/OPS.restore/OPS.transform, exactly as a real PDF content
-// stream interpreter must.
+// stream interpreter must. Drawing layers (PDF Optional Content Groups,
+// "OCGs") are tracked the same way, via OPS.beginMarkedContentProps/
+// OPS.beginMarkedContent/OPS.endMarkedContent - also verified empirically
+// (a real OCG-tagged path's marked-content args carry the OCG's object
+// reference id, resolved to a human-readable name via
+// PDFDocumentProxy.getOptionalContentConfig()).
 
 export interface Point2D {
   x: number
@@ -56,6 +99,37 @@ export interface PolylineNode {
    *  of a CAD export that draws a closed shape without an explicit close operator) is a
    *  downstream spatial-analysis concern, not this ingestion adapter's. */
   closed: boolean
+  /** The drawing layer (PDF Optional Content Group) this path was drawn under, if any - the
+   *  OCG's real /Name, or its raw object-reference id if the OCG has no name. Omitted entirely
+   *  (not `undefined`-valued) when the path was drawn outside any marked-content/OCG block. */
+  layer?: string
+}
+
+export interface TextNode {
+  text: string
+  /** The text run's origin, in millimeters, already CTM-transformed to page space by pdfjs's
+   *  own getTextContent() (see this file's header comment). */
+  position: Point2D
+  /** Approximate rendered glyph height, in millimeters - derived from the text rendering
+   *  matrix's y-basis vector magnitude, not a font's nominal point size (which can differ under
+   *  a non-uniform CTM). */
+  fontSizeMm: number
+}
+
+export interface PdfLayer {
+  /** The OCG's PDF object-reference id (e.g. "6R") - stable within one document, not a
+   *  human-authored identifier. */
+  id: string
+  /** The OCG's real /Name, or null if the layer was declared without one. */
+  name: string | null
+}
+
+export interface ScaleAnnotation {
+  /** The exact substring matched, e.g. "SCALE 1:50". */
+  text: string
+  /** Parsed ratio: for "1:50" this is 50 - one drawing unit represents 50 real-world units. */
+  ratio: number
+  position: Point2D
 }
 
 export interface PdfVectorExtractionOptions {
@@ -208,10 +282,33 @@ function decodeConstructPathBuffer(buffer: Float32Array, matrix: Matrix, millime
   return polylines
 }
 
-function extractPolylinesFromOperatorList(opList: PdfOperatorListLike, millimetersPerUnit: number, curveSegments: number): PolylineNode[] {
+// ---------------------------------------------------------------------------
+// Drawing layers (Optional Content Groups).
+// ---------------------------------------------------------------------------
+
+function buildLayerNameMap(occConfig: OptionalContentConfigLike): Map<string, string | null> {
+  const groups = occConfig.serializable.data?.groups ?? []
+  return new Map(groups.map((group) => [group.id, group.name]))
+}
+
+function layersFromNameMap(layerNameById: ReadonlyMap<string, string | null>): PdfLayer[] {
+  return Array.from(layerNameById, ([id, name]) => ({ id, name }))
+}
+
+function isOcMarkedContentArgs(args: unknown[] | null): args is [string, { id: string }] {
+  return args !== null && args.length >= 2 && args[0] === 'OC' && typeof args[1] === 'object' && args[1] !== null && 'id' in args[1]
+}
+
+// ---------------------------------------------------------------------------
+// Path + layer extraction over one page's operator list.
+// ---------------------------------------------------------------------------
+
+function extractPolylinesFromOperatorList(opList: PdfOperatorListLike, millimetersPerUnit: number, curveSegments: number, layerNameById: ReadonlyMap<string, string | null>): PolylineNode[] {
   const polylines: PolylineNode[] = []
   const matrixStack: Matrix[] = [IDENTITY_MATRIX]
+  const layerStack: (string | undefined)[] = [undefined]
   const currentMatrix = (): Matrix => matrixStack[matrixStack.length - 1]
+  const currentLayer = (): string | undefined => layerStack[layerStack.length - 1]
 
   for (let i = 0; i < opList.fnArray.length; i++) {
     const fn = opList.fnArray[i]
@@ -224,10 +321,28 @@ function extractPolylinesFromOperatorList(opList: PdfOperatorListLike, millimete
       const args = opList.argsArray[i] as number[]
       const m: Matrix = [args[0], args[1], args[2], args[3], args[4], args[5]]
       matrixStack[matrixStack.length - 1] = composeMatrix(m, currentMatrix())
+    } else if (fn === OPS.beginMarkedContentProps || fn === OPS.beginMarkedContent) {
+      const args = opList.argsArray[i]
+      let layerName: string | undefined
+      if (isOcMarkedContentArgs(args)) {
+        const resolved = layerNameById.get(args[1].id)
+        layerName = resolved ?? args[1].id
+      }
+      // A marked-content block with no OC tag of its own (e.g. a plain
+      // /Span for accessibility) inherits whatever layer is already
+      // active, rather than clearing it.
+      layerStack.push(layerName ?? currentLayer())
+    } else if (fn === OPS.endMarkedContent) {
+      if (layerStack.length > 1) layerStack.pop()
     } else if (fn === OPS.constructPath) {
       const args = opList.argsArray[i] as [unknown, Float32Array[], unknown]
+      const layer = currentLayer()
       for (const buffer of args[1]) {
-        polylines.push(...decodeConstructPathBuffer(buffer, currentMatrix(), millimetersPerUnit, curveSegments))
+        const decoded = decodeConstructPathBuffer(buffer, currentMatrix(), millimetersPerUnit, curveSegments)
+        for (const polyline of decoded) {
+          if (layer !== undefined) polyline.layer = layer
+          polylines.push(polyline)
+        }
       }
     }
   }
@@ -236,33 +351,23 @@ function extractPolylinesFromOperatorList(opList: PdfOperatorListLike, millimete
 }
 
 // ---------------------------------------------------------------------------
-// Public entrypoint.
+// Shared document-loading plumbing.
 // ---------------------------------------------------------------------------
 
-/** Extracts real vector geometry from a PDF's content streams as one
- *  PolylineNode[] per requested page (`PolylineNode[][]`, outer index =
- *  page). Every coordinate is already in millimeters and already CTM-
- *  transformed to page space - see PdfVectorExtractionOptions for unit and
- *  drawing-scale control. Raster images, text, and PDF annotations are not
- *  represented at all; only real path-construction operators are read. */
-export async function extractPdfVectorPaths(pdfBytes: Uint8Array, options: PdfVectorExtractionOptions = {}): Promise<PolylineNode[][]> {
-  const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
+async function withLoadedDocument<T>(pdfBytes: Uint8Array, maxBytes: number, fn: (doc: PdfDocumentLike) => Promise<T>): Promise<T> {
   if (pdfBytes.byteLength > maxBytes) {
     throw new PdfVectorExtractionError(`PDF (${pdfBytes.byteLength} bytes) exceeds the ${maxBytes} byte limit`)
   }
 
-  const millimetersPerUnit = (options.millimetersPerPoint ?? PDF_POINTS_TO_MM) * (options.drawingScale ?? 1)
-  const curveSegments = options.curveSegments ?? DEFAULT_CURVE_SEGMENTS
-
   // pdfjs-dist's own docs warn that a TypedArray passed as `data` is
   // "generally transferred to the worker-thread... it will take ownership
   // of the TypedArrays" - confirmed the hard way (a real DataCloneError)
-  // before this copy was added: calling this function twice with the SAME
-  // caller-supplied buffer (a completely reasonable thing to do - e.g. this
-  // file's own tests extracting the same fixture with two different
-  // `options`) detached it on the first call and threw on the second.
-  // Copying here keeps `pdfBytes` a value this function only reads, never a
-  // buffer callers must remember not to reuse.
+  // before this copy was added: calling this module's functions twice with
+  // the SAME caller-supplied buffer (a completely reasonable thing to do -
+  // e.g. this file's own tests extracting the same fixture with two
+  // different `options`) detached it on the first call and threw on the
+  // second. Copying here keeps `pdfBytes` a value callers only need to
+  // read, never a buffer they must remember not to reuse.
   const data = new Uint8Array(pdfBytes)
 
   // No `disableWorker` option: pdfjs-dist's legacy Node build already
@@ -273,8 +378,8 @@ export async function extractPdfVectorPaths(pdfBytes: Uint8Array, options: PdfVe
   // type. isEvalSupported: false disables pdfjs's optional eval()/
   // new Function() fast paths - consistent with this project's standing
   // refusal to execute untrusted input anywhere (CeilingAgent.ts's own
-  // header comment). useSystemFonts: false keeps this hermetic - vector
-  // path extraction never needs to touch the host's installed fonts.
+  // header comment). useSystemFonts: false keeps this hermetic - text/path
+  // extraction never needs to touch the host's installed fonts.
   const documentParams: Parameters<typeof getDocument>[0] & { isEvalSupported: boolean } = {
     data,
     isEvalSupported: false,
@@ -283,20 +388,120 @@ export async function extractPdfVectorPaths(pdfBytes: Uint8Array, options: PdfVe
   const loadingTask = getDocument(documentParams)
 
   try {
-    const doc = await loadingTask.promise
-    const pageNumbers = options.pages ?? Array.from({ length: doc.numPages }, (_, i) => i + 1)
-
-    const result: PolylineNode[][] = []
-    for (const pageNumber of pageNumbers) {
-      if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > doc.numPages) {
-        throw new PdfVectorExtractionError(`page ${pageNumber} does not exist (document has ${doc.numPages} page(s))`)
-      }
-      const page = await doc.getPage(pageNumber)
-      const opList = await page.getOperatorList()
-      result.push(extractPolylinesFromOperatorList(opList, millimetersPerUnit, curveSegments))
-    }
-    return result
+    const doc = (await loadingTask.promise) as unknown as PdfDocumentLike
+    return await fn(doc)
   } finally {
     await loadingTask.destroy()
   }
+}
+
+function resolvePageNumbers(doc: PdfDocumentLike, requested: number[] | undefined): number[] {
+  const pageNumbers = requested ?? Array.from({ length: doc.numPages }, (_, i) => i + 1)
+  for (const pageNumber of pageNumbers) {
+    if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > doc.numPages) {
+      throw new PdfVectorExtractionError(`page ${pageNumber} does not exist (document has ${doc.numPages} page(s))`)
+    }
+  }
+  return pageNumbers
+}
+
+// ---------------------------------------------------------------------------
+// Public entrypoints.
+// ---------------------------------------------------------------------------
+
+/** Extracts real vector geometry from a PDF's content streams as one
+ *  PolylineNode[] per requested page (`PolylineNode[][]`, outer index =
+ *  page). Every coordinate is already in millimeters and already CTM-
+ *  transformed to page space - see PdfVectorExtractionOptions for unit and
+ *  drawing-scale control. Each polyline is tagged with its drawing layer
+ *  (Optional Content Group), when it was drawn under one. Raster images
+ *  and PDF annotations are not represented at all; only real
+ *  path-construction operators are read. */
+export async function extractPdfVectorPaths(pdfBytes: Uint8Array, options: PdfVectorExtractionOptions = {}): Promise<PolylineNode[][]> {
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
+  const millimetersPerUnit = (options.millimetersPerPoint ?? PDF_POINTS_TO_MM) * (options.drawingScale ?? 1)
+  const curveSegments = options.curveSegments ?? DEFAULT_CURVE_SEGMENTS
+
+  return withLoadedDocument(pdfBytes, maxBytes, async (doc) => {
+    const pageNumbers = resolvePageNumbers(doc, options.pages)
+    const occConfig = await doc.getOptionalContentConfig()
+    const layerNameById = buildLayerNameMap(occConfig)
+
+    const result: PolylineNode[][] = []
+    for (const pageNumber of pageNumbers) {
+      const page = await doc.getPage(pageNumber)
+      const opList = await page.getOperatorList()
+      result.push(extractPolylinesFromOperatorList(opList, millimetersPerUnit, curveSegments, layerNameById))
+    }
+    return result
+  })
+}
+
+/** Extracts real text runs from a PDF's pages as one TextNode[] per
+ *  requested page. Position and (approximate) rendered size are already
+ *  CTM-transformed and converted to millimeters. Text is NOT tagged with
+ *  its drawing layer - see this file's header comment for the scoping
+ *  reason (pdfjs's high-level text API doesn't expose marked-content
+ *  context the way its raw operator list does for paths). */
+export async function extractPdfTextNodes(pdfBytes: Uint8Array, options: PdfVectorExtractionOptions = {}): Promise<TextNode[][]> {
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
+  const millimetersPerUnit = (options.millimetersPerPoint ?? PDF_POINTS_TO_MM) * (options.drawingScale ?? 1)
+
+  return withLoadedDocument(pdfBytes, maxBytes, async (doc) => {
+    const pageNumbers = resolvePageNumbers(doc, options.pages)
+
+    const result: TextNode[][] = []
+    for (const pageNumber of pageNumbers) {
+      const page = await doc.getPage(pageNumber)
+      const textContent = await page.getTextContent()
+      const nodes: TextNode[] = []
+      for (const item of textContent.items) {
+        if (typeof item.str !== 'string' || item.str.length === 0 || !item.transform) continue // a TextMarkedContent entry, not real text
+        const [, , c, d, e, f] = item.transform
+        nodes.push({
+          text: item.str,
+          position: { x: e * millimetersPerUnit, y: f * millimetersPerUnit },
+          fontSizeMm: Math.hypot(c, d) * millimetersPerUnit,
+        })
+      }
+      result.push(nodes)
+    }
+    return result
+  })
+}
+
+/** Extracts a PDF's declared drawing layers (Optional Content Groups) -
+ *  every layer the document declares, regardless of whether any content is
+ *  currently tagged under it. */
+export async function extractPdfLayers(pdfBytes: Uint8Array, options: Pick<PdfVectorExtractionOptions, 'maxBytes'> = {}): Promise<PdfLayer[]> {
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
+  return withLoadedDocument(pdfBytes, maxBytes, async (doc) => {
+    const occConfig = await doc.getOptionalContentConfig()
+    return layersFromNameMap(buildLayerNameMap(occConfig))
+  })
+}
+
+// A scale ratio stated as text, e.g. "SCALE 1:50", "Scale: 1 : 100", or a
+// bare "1:1250" - the numerator is always fixed at 1 (the universal AEC
+// drawing-scale convention: NRM2/CESMM4-style scales are always expressed
+// as "1:N"). Deliberately permissive about the "SCALE" prefix being present
+// - many drawings print the ratio alone next to a graphic bar - see this
+// file's header comment for why this is scoped to TEXT patterns only, not
+// graphic scale-bar recognition.
+const SCALE_ANNOTATION_PATTERN = /(?:scale\s*[:=]?\s*)?\b1\s*:\s*(\d{1,6}(?:\.\d+)?)\b/gi
+
+/** Finds text runs that state a drawing scale ratio (e.g. "SCALE 1:50"),
+ *  over an already-extracted page's text nodes. Pure and synchronous - run
+ *  it over extractPdfTextNodes's own output. A best-effort text-pattern
+ *  match, not a validated calibration - see this file's header comment. */
+export function findScaleAnnotations(textNodes: readonly TextNode[]): ScaleAnnotation[] {
+  const annotations: ScaleAnnotation[] = []
+  for (const node of textNodes) {
+    const pattern = new RegExp(SCALE_ANNOTATION_PATTERN)
+    let match: RegExpExecArray | null
+    while ((match = pattern.exec(node.text)) !== null) {
+      annotations.push({ text: match[0], ratio: Number(match[1]), position: node.position })
+    }
+  }
+  return annotations
 }

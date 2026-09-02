@@ -1,6 +1,6 @@
 import { describe, test, expect } from 'vitest'
 import fc from 'fast-check'
-import { extractPdfVectorPaths, PdfVectorExtractionError } from './pdf_vector'
+import { extractPdfVectorPaths, extractPdfTextNodes, extractPdfLayers, findScaleAnnotations, PdfVectorExtractionError, type TextNode } from './pdf_vector'
 
 // Real vector PDF fixtures, not mocks: every test below builds a genuine,
 // spec-valid (PDF 1.4) single-page PDF byte stream and feeds it through the
@@ -69,6 +69,39 @@ function buildMultiPagePdf(contentStreams: string[]): Uint8Array {
   for (let i = 1; i <= totalObjects; i++) pdf += `${offsets[i].toString().padStart(10, '0')} 00000 n \n`
   pdf += `trailer\n<< /Size ${totalObjects + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`
   return new Uint8Array(Buffer.from(pdf, 'latin1'))
+}
+
+/** A real PDF with a font resource (for text) and/or an /OCProperties
+ *  catalog entry + a named Properties resource (for drawing layers) -
+ *  buildMinimalPdf's fixed, empty /Resources dict can't express either. */
+function buildPdfWithResources(catalogExtra: string, resourcesExtra: string, contentStream: string, extraObjects: Record<number, string> = {}): Uint8Array {
+  const objects: Record<number, string> = {
+    1: `1 0 obj\n<< /Type /Catalog /Pages 2 0 R${catalogExtra} >>\nendobj\n`,
+    2: '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n',
+    3: `3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 2000 2000] /Contents 4 0 R /Resources << ${resourcesExtra} >> >>\nendobj\n`,
+    4: `4 0 obj\n<< /Length ${contentStream.length} >>\nstream\n${contentStream}\nendstream\nendobj\n`,
+    ...extraObjects,
+  }
+
+  const maxId = Math.max(...Object.keys(objects).map(Number))
+  let pdf = '%PDF-1.4\n'
+  const offsets: number[] = [0]
+  for (let i = 1; i <= maxId; i++) {
+    offsets[i] = pdf.length
+    pdf += objects[i] ?? ''
+  }
+  const xrefOffset = pdf.length
+  pdf += `xref\n0 ${maxId + 1}\n0000000000 65535 f \n`
+  for (let i = 1; i <= maxId; i++) pdf += `${(offsets[i] ?? 0).toString().padStart(10, '0')} 00000 n \n`
+  pdf += `trailer\n<< /Size ${maxId + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`
+  return new Uint8Array(Buffer.from(pdf, 'latin1'))
+}
+
+const HELVETICA_FONT_OBJECT = { 5: '5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n' }
+const FONT_RESOURCES = '/Font << /F1 5 0 R >>'
+
+function textShowingContentStream(x: number, y: number, text: string): string {
+  return `BT /F1 12 Tf ${x} ${y} Td (${text}) Tj ET`
 }
 
 interface GeneratedSubpath {
@@ -250,5 +283,110 @@ describe('extractPdfVectorPaths: fails closed on invalid input rather than retur
   test('requesting a page number that does not exist is rejected', async () => {
     const pdfBytes = buildMinimalPdf('0 0 m 10 0 l S')
     await expect(extractPdfVectorPaths(pdfBytes, { pages: [5] })).rejects.toThrow(PdfVectorExtractionError)
+  })
+})
+
+describe('extractPdfTextNodes: real text extraction, position and size already in mm', () => {
+  test('extracts the real text string, at its correct mm-converted position', async () => {
+    const pdfBytes = buildPdfWithResources('', FONT_RESOURCES, textShowingContentStream(100, 700, 'Hello World'), HELVETICA_FONT_OBJECT)
+    const pages = await extractPdfTextNodes(pdfBytes)
+    expect(pages[0]).toHaveLength(1)
+    expect(pages[0][0].text).toBe('Hello World')
+    expect(pages[0][0].position.x).toBeCloseTo(100 * PDF_POINTS_TO_MM, 6)
+    expect(pages[0][0].position.y).toBeCloseTo(700 * PDF_POINTS_TO_MM, 6)
+    // 12pt font, no rotation/skew -> the y-basis vector magnitude is exactly 12.
+    expect(pages[0][0].fontSizeMm).toBeCloseTo(12 * PDF_POINTS_TO_MM, 6)
+  })
+
+  test('a cm transform in effect when text is drawn is reflected in its extracted position (already CTM-composed by pdfjs itself)', async () => {
+    const content = `q\n2 0 0 2 0 0 cm\n${textShowingContentStream(50, 50, 'Scaled')}\nQ`
+    const pdfBytes = buildPdfWithResources('', FONT_RESOURCES, content, HELVETICA_FONT_OBJECT)
+    const pages = await extractPdfTextNodes(pdfBytes)
+    expect(pages[0][0].position.x).toBeCloseTo(100 * PDF_POINTS_TO_MM, 6)
+    expect(pages[0][0].position.y).toBeCloseTo(100 * PDF_POINTS_TO_MM, 6)
+  })
+
+  test('multiple text runs on one page are all extracted, in order', async () => {
+    const content = [textShowingContentStream(0, 0, 'First'), textShowingContentStream(0, 20, 'Second')].join('\n')
+    const pdfBytes = buildPdfWithResources('', FONT_RESOURCES, content, HELVETICA_FONT_OBJECT)
+    const pages = await extractPdfTextNodes(pdfBytes)
+    expect(pages[0].map((n) => n.text)).toEqual(['First', 'Second'])
+  })
+})
+
+describe('findScaleAnnotations: text-pattern scale-ratio detection (not visual scale-bar recognition - see this file\'s module under test)', () => {
+  function textNodeAt(text: string, x = 0, y = 0): TextNode {
+    return { text, position: { x, y }, fontSizeMm: 3 }
+  }
+
+  test.each([
+    ['SCALE 1:50', 50],
+    ['Scale: 1 : 100', 100],
+    ['scale=1:20', 20],
+    ['1:1250', 1250],
+    ['SCALE 1:1.5', 1.5],
+  ])('recognizes %j as a 1:%s ratio', (text, expectedRatio) => {
+    const annotations = findScaleAnnotations([textNodeAt(String(text))])
+    expect(annotations).toHaveLength(1)
+    expect(annotations[0].ratio).toBe(expectedRatio)
+  })
+
+  test('text with no scale ratio produces no annotations', () => {
+    expect(findScaleAnnotations([textNodeAt('Room 101 - Office')])).toEqual([])
+  })
+
+  test('carries through the source text node\'s own position', () => {
+    const annotations = findScaleAnnotations([textNodeAt('SCALE 1:50', 42, 99)])
+    expect(annotations[0].position).toEqual({ x: 42, y: 99 })
+  })
+
+  test('finds every match across multiple text nodes, independently', () => {
+    const annotations = findScaleAnnotations([textNodeAt('SCALE 1:50', 0, 0), textNodeAt('Detail A SCALE 1:20', 10, 10)])
+    expect(annotations.map((a) => a.ratio)).toEqual([50, 20])
+  })
+
+  test('property: for any generated ratio, "SCALE 1:N" round-trips to exactly that ratio', () => {
+    fc.assert(
+      fc.property(fc.integer({ min: 1, max: 999999 }), (n) => {
+        const annotations = findScaleAnnotations([textNodeAt(`SCALE 1:${n}`)])
+        expect(annotations).toHaveLength(1)
+        expect(annotations[0].ratio).toBe(n)
+      }),
+      { numRuns: 100 }
+    )
+  })
+})
+
+describe('extractPdfLayers and per-polyline layer tagging (PDF Optional Content Groups)', () => {
+  const DRAINAGE_OCG = { 6: '6 0 obj\n<< /Type /OCG /Name (Drainage Layer) >>\nendobj\n' }
+  const OCG_CATALOG = ' /OCProperties << /OCGs [6 0 R] /D << /ON [6 0 R] >> >>'
+  const OCG_RESOURCES = '/Properties << /MC0 6 0 R >>'
+
+  test('extractPdfLayers lists every declared layer, by real name', async () => {
+    const pdfBytes = buildPdfWithResources(OCG_CATALOG, OCG_RESOURCES, '0 0 m 1 1 l S', DRAINAGE_OCG)
+    const layers = await extractPdfLayers(pdfBytes)
+    expect(layers).toEqual([{ id: '6R', name: 'Drainage Layer' }])
+  })
+
+  test('a document with no /OCProperties at all reports zero layers, not an error (real, empirically-found edge case)', async () => {
+    const pdfBytes = buildMinimalPdf('0 0 m 1 1 l S')
+    await expect(extractPdfLayers(pdfBytes)).resolves.toEqual([])
+  })
+
+  test('a path drawn inside an OC-tagged marked-content block is tagged with the real layer name; one drawn outside is not tagged at all', async () => {
+    const content = ['/OC /MC0 BDC', '0 0 m', '10 10 l', 'S', 'EMC', '20 20 m', '30 30 l', 'S'].join('\n')
+    const pdfBytes = buildPdfWithResources(OCG_CATALOG, OCG_RESOURCES, content, DRAINAGE_OCG)
+    const pages = await extractPdfVectorPaths(pdfBytes)
+
+    expect(pages[0]).toHaveLength(2)
+    expect(pages[0][0].layer).toBe('Drainage Layer')
+    expect(pages[0][1].layer).toBeUndefined()
+    expect(Object.hasOwn(pages[0][1], 'layer')).toBe(false) // omitted entirely, not an undefined-valued key
+  })
+
+  test('a path drawn on a document with no layers at all carries no layer field', async () => {
+    const pdfBytes = buildMinimalPdf('0 0 m 10 0 l S')
+    const pages = await extractPdfVectorPaths(pdfBytes)
+    expect(pages[0][0].layer).toBeUndefined()
   })
 })
